@@ -1,0 +1,16 @@
+services:
+  backend:
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+
+  frontend:
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:3000"
+
+  guacamole:
+    ports:
+      - "127.0.0.1:${GUACAMOLE_HOST_PORT:-8081}:8080"
+
+  nginx:
+    profiles:
+      - docker-edge

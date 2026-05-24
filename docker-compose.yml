@@ -1,0 +1,109 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cloudlabs}
+      POSTGRES_USER: ${POSTGRES_USER:-cloudlabs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cloudlabs}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cloudlabs}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  guac-init:
+    image: guacamole/guacamole:1.5.5
+    user: root
+    command: ["/bin/sh", "-c", "/opt/guacamole/bin/initdb.sh --postgresql > /initdb/001-guacamole.sql"]
+    volumes:
+      - guac-initdb:/initdb
+
+  guac-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      guac-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DB: ${GUAC_POSTGRES_DB:-guacamole_db}
+      POSTGRES_USER: ${GUAC_POSTGRES_USER:-guacamole_user}
+      POSTGRES_PASSWORD: ${GUAC_POSTGRES_PASSWORD:-guacamole_pass}
+    volumes:
+      - guac-postgres-data:/var/lib/postgresql/data
+      - guac-initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GUAC_POSTGRES_USER:-guacamole_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    restart: unless-stopped
+    depends_on:
+      guacd:
+        condition: service_started
+      guac-postgres:
+        condition: service_healthy
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: guac-postgres
+      POSTGRESQL_DATABASE: ${GUAC_POSTGRES_DB:-guacamole_db}
+      POSTGRESQL_USER: ${GUAC_POSTGRES_USER:-guacamole_user}
+      POSTGRESQL_PASSWORD: ${GUAC_POSTGRES_PASSWORD:-guacamole_pass}
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      guacamole:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cloudlabs}:${POSTGRES_PASSWORD:-cloudlabs}@postgres:5432/${POSTGRES_DB:-cloudlabs}
+      GUACAMOLE_BASE_URL: http://guacamole:8080/guacamole
+      LAB_INSTANCE_MARKET: ${LAB_INSTANCE_MARKET:-on-demand}
+      LAB_SPOT_ENABLED: ${LAB_SPOT_ENABLED:-false}
+      LAB_SPOT_MAX_PRICE: ${LAB_SPOT_MAX_PRICE:-}
+      LAB_SPOT_FALLBACK_TO_ON_DEMAND: ${LAB_SPOT_FALLBACK_TO_ON_DEMAND:-true}
+      LAB_SPOT_INSTANCE_TYPES: ${LAB_SPOT_INSTANCE_TYPES:-}
+      LAB_ROOT_VOLUME_SIZE_GB: ${LAB_ROOT_VOLUME_SIZE_GB:-64}
+    expose:
+      - "8000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    user: "node"
+    environment:
+      NEXT_PUBLIC_API_BASE: /api
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+      - guacamole
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./infra/nginx/certs:/etc/nginx/certs:ro
+
+volumes:
+  postgres-data:
+  guac-postgres-data:
+  guac-initdb:
