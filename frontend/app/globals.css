@@ -407,6 +407,40 @@
     color: var(--unext-ink);
   }
 
+  .choice-tile {
+    display: grid;
+    min-height: 112px;
+    gap: 0.35rem;
+    justify-items: start;
+    border: 1px solid rgba(251, 146, 60, 0.34);
+    border-radius: 8px;
+    background: #ffffff;
+    padding: 0.9rem;
+    color: #263241;
+    text-align: left;
+  }
+
+  .choice-tile svg {
+    color: #c2410c;
+  }
+
+  .choice-tile span {
+    font-weight: 950;
+  }
+
+  .choice-tile small {
+    color: #667085;
+    font-size: 0.78rem;
+    font-weight: 700;
+    line-height: 1.35;
+  }
+
+  .choice-tile-active,
+  .choice-tile:hover {
+    border-color: var(--unext-orange);
+    background: #fff7ed;
+  }
+
   .toggle-row {
     border-color: rgba(251, 146, 60, 0.32);
     background: #fffbf6;

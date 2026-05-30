@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.security import hash_password
 from app.db.session import SessionLocal, init_db
 from app.models.models import Admin
+from app.services.labs import resume_pending_provisioning
 from app.workers.cleanup import cleanup_loop
 
 settings = get_settings()
@@ -42,5 +43,5 @@ async def startup() -> None:
             )
             await db.commit()
     asyncio.create_task(cleanup_loop())
-    log.info("cloud_lab_platform_started", environment=settings.environment)
-
+    requeued = await resume_pending_provisioning()
+    log.info("cloud_lab_platform_started", environment=settings.environment, requeued_provisioning_labs=requeued)

@@ -7,8 +7,10 @@ from botocore.config import Config
 
 FALLBACK_PRICES = {
     "t3.medium": 0.12,
-    "t3.large": 0.20,
-    "t3a.xlarge": 0.30,
+    "t3.large": 0.1138,
+    "t3a.large": 0.0986,
+    "t3.xlarge": 0.2528,
+    "t3a.xlarge": 0.1722,
     "c5a.xlarge": 0.33,
     "c6a.xlarge": 0.2775,
     "c6i.xlarge": 0.34,
@@ -30,6 +32,10 @@ REGION_LOCATION = {
     "ap-southeast-1": "Asia Pacific (Singapore)",
     "eu-west-1": "EU (Ireland)",
 }
+
+
+def fallback_windows_price(instance_type: str) -> float:
+    return FALLBACK_PRICES.get(instance_type, 0.1)
 
 
 @lru_cache(maxsize=256)

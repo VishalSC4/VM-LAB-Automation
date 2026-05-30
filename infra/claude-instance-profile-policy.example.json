@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadClaudeProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::YOUR_CLAUDE_PROFILE_BUCKET/claude-profiles/*"
+    },
+    {
+      "Sid": "DecryptClaudeProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "arn:aws:kms:REGION:ACCOUNT_ID:key/YOUR_KMS_KEY_ID",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.REGION.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

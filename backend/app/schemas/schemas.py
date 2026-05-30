@@ -1,4 +1,5 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, model_validator
 
 from app.models.models import LabStatus
@@ -16,6 +17,7 @@ class LoginIn(BaseModel):
 
 class BatchCreate(BaseModel):
     name: str = Field(min_length=2, max_length=160)
+    lab_type: str = Field(default="windows", pattern=r"^(windows|claude)$")
     user_count: int = Field(ge=1, le=500)
     duration_hours: float = Field(gt=0, le=720)
     budget_per_vm: float = Field(gt=0)
@@ -42,7 +44,16 @@ class BatchCreate(BaseModel):
         ]
         if any(value is None for value in required):
             raise ValueError("Schedule date, days, start time, and end time are required")
-        if self.schedule_start_time >= self.schedule_end_time:
+        try:
+            start_time = time.fromisoformat(self.schedule_start_time)
+            end_time = time.fromisoformat(self.schedule_end_time)
+        except ValueError as exc:
+            raise ValueError("Schedule times must be valid HH:MM values") from exc
+        try:
+            ZoneInfo(self.schedule_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Schedule timezone must be a valid IANA timezone") from exc
+        if start_time >= end_time:
             raise ValueError("Schedule end time must be after start time")
         return self
 
@@ -54,6 +65,7 @@ class LabBudgetCreditIn(BaseModel):
 class BatchOut(BaseModel):
     id: str
     name: str
+    lab_type: str = "windows"
     user_count: int
     duration_hours: float
     budget_per_vm: float
@@ -80,6 +92,8 @@ class LabOut(BaseModel):
     status: LabStatus
     aws_region: str
     instance_type: str
+    lab_type: str = "windows"
+    claude_profile_id: str | None = None
     requested_instance_market: str = "on-demand"
     instance_market: str = "on-demand"
     ec2_instance_id: str | None
@@ -136,6 +150,8 @@ class LabOut(BaseModel):
             "status": value.status,
             "aws_region": value.aws_region,
             "instance_type": value.instance_type,
+            "lab_type": value.lab_type,
+            "claude_profile_id": value.claude_profile_id,
             "requested_instance_market": value.requested_instance_market,
             "instance_market": value.instance_market,
             "ec2_instance_id": value.ec2_instance_id,

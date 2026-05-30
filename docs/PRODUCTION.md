@@ -20,10 +20,12 @@ One EC2 host runs Docker Compose for the admin UI, FastAPI API, NGINX, PostgreSQ
 
 Allow:
 
-- `ec2:RunInstances`, `ec2:RequestSpotInstances`, `ec2:StartInstances`, `ec2:StopInstances`, `ec2:TerminateInstances`, `ec2:DescribeInstances`, `ec2:DescribeSpotPriceHistory`, `ec2:CreateTags`
+- `ec2:RunInstances`, `ec2:RequestSpotInstances`, `ec2:StartInstances`, `ec2:StopInstances`, `ec2:TerminateInstances`, `ec2:CancelSpotInstanceRequests`, `ec2:DescribeInstances`, `ec2:DescribeImages`, `ec2:DescribeVolumes`, `ec2:DescribeFastLaunchImages`, `ec2:DescribeSpotPriceHistory`, `ec2:GetConsoleOutput`, `ec2:CreateTags`, `ec2:DeleteVolume`
 - `iam:PassRole` for the configured lab instance profile, if one is used
 - `pricing:GetProducts`
-- `secretsmanager:CreateSecret`, `secretsmanager:PutSecretValue`, `secretsmanager:DeleteSecret`
+- `secretsmanager:ListSecrets`, `secretsmanager:CreateSecret`, `secretsmanager:GetSecretValue`, `secretsmanager:DeleteSecret`
+- `ssm:DescribeInstanceInformation`, `ssm:SendCommand`, `ssm:GetCommandInvocation`, `ssm:GetParametersByPath`, `ssm:DeleteParameter`, `ssm:DeleteParameters`
+- `s3:GetObject`, `s3:GetObjectVersion` for Claude profile preflight if Claude labs are enabled
 - `logs:CreateLogStream`, `logs:PutLogEvents` if shipping logs to CloudWatch
 
 Restrict EC2 actions by VPC, subnet, approved AMI IDs, security group, and tags where possible.
@@ -31,14 +33,21 @@ Restrict EC2 actions by VPC, subnet, approved AMI IDs, security group, and tags 
 Spot production settings:
 
 ```env
+LAB_SUBNET_IDS=subnet-xxxxxxxx,subnet-yyyyyyyy,subnet-zzzzzzzz
 LAB_SPOT_ENABLED=true
 LAB_INSTANCE_MARKET=spot
 LAB_SPOT_FALLBACK_TO_ON_DEMAND=true
-LAB_SPOT_INSTANCE_TYPES=c6a.xlarge,c5a.xlarge,c6i.xlarge,c5.xlarge,m6a.xlarge,m5a.xlarge,m5.xlarge
+LAB_SPOT_INSTANCE_TYPES=t3a.xlarge,t3.xlarge,c6a.xlarge,c5a.xlarge,c5.xlarge,c6i.xlarge,c7i.xlarge
 LAB_SPOT_MAX_PRICE=
+LAB_ROOT_VOLUME_SIZE_GB=100
+LAB_PROVISION_STAGGER_SECONDS=0
 ```
 
-Spot labs use one-time requests and terminate on interruption. Keep On-Demand fallback enabled for learner-facing batches unless the event can tolerate failed launches during Spot capacity shortages.
+Use lab subnets in at least two Availability Zones. Spot and On-Demand capacity errors are often scoped to a single AZ, and the backend retries each configured subnet before falling back.
+
+Keep `LAB_PROVISION_STAGGER_SECONDS=0` when all learners need labs ready together. Increase it only if AWS request-rate throttling appears during very large batches.
+
+Spot labs use persistent Spot requests with interruption behavior set to `stop`, so budget exhaustion can stop the VM and budget credit can start it again when Spot capacity is available. Expiry cleanup cancels the persistent Spot request before terminating the VM so AWS does not relaunch a replacement.
 
 ## HTTPS
 

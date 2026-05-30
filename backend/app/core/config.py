@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     aws_region: str = "ap-south-1"
     default_vpc_id: str | None = None
     lab_subnet_id: str | None = None
+    lab_subnet_ids: str | None = None
     lab_security_group_id: str | None = None
     lab_key_name: str | None = None
     lab_iam_instance_profile: str | None = None
@@ -28,6 +29,15 @@ class Settings(BaseSettings):
     lab_spot_instance_types: str | None = None
     lab_root_volume_size_gb: int = Field(default=64, ge=30, le=1024)
     windows_admin_user: str = "Administrator"
+    claude_profile_bucket: str | None = None
+    claude_profile_prefix: str = "claude-profiles/"
+    claude_profile_ids: str = "siddharthyadav63_ymail_com"
+    claude_profile_archive_suffix: str = ".zip"
+    claude_account_email: str = "siddharthyadav63@ymail.com"
+    claude_require_profile_archive: bool = True
+    claude_require_fast_launch: bool = True
+    claude_fast_launch_min_target_count: int = Field(default=6, ge=1, le=100)
+    lab_provision_stagger_seconds: int = Field(default=15, ge=0, le=120)
 
     guacamole_base_url: str = "http://guacamole:8080/guacamole"
     guacamole_public_url: str = ""

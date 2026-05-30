@@ -11,7 +11,7 @@ from app.core.config import get_settings
 from app.db.session import get_db
 from app.models.models import Admin, AuditLog, Batch, CleanupReason, Lab, LabStatus
 from app.schemas.schemas import BatchCreate, BatchOut, DashboardOut, LabBudgetCreditIn, LabCredentialsExportOut, LabCredentialOut, LabExtendIn, LabOut, LogOut, StudentLabOut, StudentLoginIn
-from app.services.labs import add_lab_budget_credit, create_batch, dashboard, extend_lab, prepare_lab_session, resume_lab, stop_lab, terminate_lab, utcnow, visible_lab_filter
+from app.services.labs import add_lab_budget_credit, create_batch, dashboard, extend_lab, prepare_lab_session, recover_failed_lab, resume_lab, stop_lab, terminate_lab, utcnow, visible_lab_filter
 from app.services.secrets import get_lab_password
 
 router = APIRouter(tags=["cloud-labs"])
@@ -75,7 +75,10 @@ async def create_batch_api(
     admin: Admin = Depends(current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    return await create_batch(db, payload, admin.id)
+    try:
+        return await create_batch(db, payload, admin.id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/batches", response_model=list[BatchOut])
@@ -166,6 +169,8 @@ async def resume_stopped_lab(
         raise HTTPException(status_code=404, detail="Lab not found")
     if lab.status == LabStatus.stopped:
         background.add_task(_resume_by_id, lab.id)
+    elif lab.status == LabStatus.failed and lab.ec2_instance_id:
+        background.add_task(_recover_by_id, lab.id)
     elif lab.status != LabStatus.running:
         raise HTTPException(status_code=409, detail=f"Lab cannot be resumed from status {lab.status.value}")
     return lab
@@ -279,6 +284,15 @@ async def _resume_by_id(lab_id: str) -> None:
         lab = await db.get(Lab, lab_id)
         if lab:
             await resume_lab(db, lab)
+
+
+async def _recover_by_id(lab_id: str) -> None:
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as db:
+        lab = await db.get(Lab, lab_id)
+        if lab:
+            await recover_failed_lab(db, lab)
 
 
 async def _stop_by_id(lab_id: str) -> None:

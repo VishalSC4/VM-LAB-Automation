@@ -19,6 +19,8 @@ export type Lab = {
   status: string;
   aws_region: string;
   instance_type: string;
+  lab_type: string;
+  claude_profile_id: string | null;
   requested_instance_market: string;
   instance_market: string;
   ec2_instance_id: string | null;

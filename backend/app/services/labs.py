@@ -2,6 +2,9 @@ import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import RetryError
@@ -12,10 +15,22 @@ from app.models.models import AuditLog, Batch, CleanupJob, CleanupReason, Lab, L
 from app.schemas.schemas import BatchCreate
 from app.services.aws_ec2 import AwsEc2Service
 from app.services.guacamole import GuacamoleService
-from app.services.pricing import get_estimated_spot_windows_price, get_hourly_windows_price
-from app.services.secrets import delete_lab_password, get_lab_password, store_lab_password
+from app.services.pricing import fallback_windows_price, get_estimated_spot_windows_price, get_hourly_windows_price
+from app.services.secrets import delete_lab_credential_artifacts, get_lab_password, store_lab_password
 
 TERMINATED_LAB_VISIBLE_HOURS = 24
+AWS_CLIENT_CONFIG = Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 1})
+
+
+def _schedule_provision_lab(lab_id: str, position: int = 0) -> None:
+    delay_seconds = get_settings().lab_provision_stagger_seconds * position
+    asyncio.create_task(_provision_lab_after_delay(lab_id, delay_seconds))
+
+
+async def _provision_lab_after_delay(lab_id: str, delay_seconds: int) -> None:
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    await provision_lab(lab_id)
 
 
 def utcnow() -> datetime:
@@ -70,6 +85,99 @@ def _requested_market(on_demand_hourly_cost: float, spot_hourly_cost: float | No
     return "on-demand"
 
 
+def _configured_claude_profiles() -> list[str]:
+    settings = get_settings()
+    return [item.strip() for item in settings.claude_profile_ids.split(",") if item.strip()]
+
+
+def _claude_profile_key(profile_id: str) -> str:
+    settings = get_settings()
+    prefix = settings.claude_profile_prefix.strip("/")
+    filename = f"{profile_id}{settings.claude_profile_archive_suffix}"
+    return f"{prefix}/{filename}" if prefix else filename
+
+
+async def _claude_profile_archive_exists(region: str, profile_id: str) -> bool:
+    settings = get_settings()
+    if not settings.claude_profile_bucket:
+        return False
+    client = boto3.client("s3", region_name=region, config=AWS_CLIENT_CONFIG)
+    try:
+        await asyncio.to_thread(
+            client.head_object,
+            Bucket=settings.claude_profile_bucket,
+            Key=_claude_profile_key(profile_id),
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"403", "404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
+
+
+async def _fast_launch_state(region: str, ami_id: str) -> tuple[str, int]:
+    client = boto3.client("ec2", region_name=region, config=AWS_CLIENT_CONFIG)
+    response = await asyncio.to_thread(client.describe_fast_launch_images, ImageIds=[ami_id])
+    images = response.get("FastLaunchImages") or []
+    if not images:
+        return "disabled", 0
+    image = images[0]
+    target_count = int((image.get("SnapshotConfiguration") or {}).get("TargetResourceCount") or 0)
+    return str(image.get("State") or "unknown"), target_count
+
+
+async def _require_fast_launch_ready(region: str, ami_id: str) -> None:
+    settings = get_settings()
+    if not settings.claude_require_fast_launch:
+        return
+    state, target_count = await _fast_launch_state(region, ami_id)
+    min_target_count = settings.claude_fast_launch_min_target_count
+    if state != "enabled" or target_count < min_target_count:
+        raise RuntimeError(
+            f"Claude AMI Fast Launch is {state} with target pool {target_count}. "
+            f"Wait until AWS reports Fast Launch enabled with target pool at least {min_target_count} for {ami_id} before launching Claude labs."
+        )
+
+
+async def _available_claude_profiles(db: AsyncSession) -> list[str]:
+    profiles = _configured_claude_profiles()
+    if not profiles:
+        return []
+    active_statuses = [
+        LabStatus.scheduled,
+        LabStatus.provisioning,
+        LabStatus.running,
+        LabStatus.stopped,
+        LabStatus.resuming,
+        LabStatus.budget_exceeded,
+    ]
+    rows = await db.scalars(
+        select(Lab.claude_profile_id).where(
+            Lab.lab_type == "claude",
+            Lab.claude_profile_id.is_not(None),
+            Lab.status.in_(active_statuses),
+        )
+    )
+    used = {profile_id for profile_id in rows if profile_id}
+    return [profile_id for profile_id in profiles if profile_id not in used]
+
+
+async def _require_claude_profile_archives(region: str, profile_ids: list[str]) -> None:
+    settings = get_settings()
+    if not settings.claude_require_profile_archive:
+        return
+    missing: list[str] = []
+    for profile_id in profile_ids:
+        if not await _claude_profile_archive_exists(region, profile_id):
+            missing.append(_claude_profile_key(profile_id))
+    if missing:
+        raise RuntimeError(
+            "Claude pre-login profile archive is missing. "
+            f"Upload a logged-in {settings.claude_account_email} profile archive to "
+            f"s3://{settings.claude_profile_bucket}/{missing[0]} before launching Claude labs."
+        )
+
+
 def _is_spot_lab(lab: Lab) -> bool:
     return (lab.instance_market or "").lower() == "spot"
 
@@ -91,8 +199,6 @@ def _lab_username(index: int, lab_id: str, created_at: datetime) -> str:
 
 
 def _rdp_username(lab: Lab) -> str:
-    if len(lab.username) <= 20:
-        return lab.username
     return get_settings().windows_admin_user
 
 
@@ -141,6 +247,34 @@ def _schedule_state(lab: Lab, now: datetime) -> str:
     return "active"
 
 
+def _pause_provisioning_until_schedule(db: AsyncSession, lab: Lab, state: str) -> None:
+    lab.status = LabStatus.scheduled
+    db.add(
+        AuditLog(
+            actor="system",
+            action="lab.schedule.wait",
+            resource_id=lab.id,
+            message=f"Provisioning paused because the scheduled window is {state}",
+        )
+    )
+
+
+async def _provisioning_was_cancelled(db: AsyncSession, lab: Lab) -> bool:
+    await db.refresh(lab)
+    if lab.status == LabStatus.provisioning:
+        return False
+    db.add(
+        AuditLog(
+            actor="system",
+            action="lab.provision.cancelled",
+            resource_id=lab.id,
+            message=f"Provisioning finished after lab moved to {lab.status.value}; leaving current status unchanged",
+        )
+    )
+    await db.commit()
+    return True
+
+
 def _batch_is_active_now(payload: BatchCreate, now: datetime) -> bool:
     if not payload.schedule_enabled:
         return True
@@ -171,6 +305,14 @@ def _lab_rdp_host_candidates(lab: Lab) -> list[str]:
     return [host for host in [lab.private_ip, lab.public_ip] if host]
 
 
+def _rdp_wait_attempts(lab: Lab) -> int:
+    return 90 if lab.lab_type == "claude" else 90
+
+
+def _windows_ready_wait_attempts(lab: Lab) -> int:
+    return 120 if lab.lab_type == "claude" else 90
+
+
 async def _can_reach_rdp(hostname: str, timeout_seconds: float = 4) -> bool:
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(hostname, 3389), timeout=timeout_seconds)
@@ -199,20 +341,68 @@ async def _reachable_rdp_host(lab: Lab, *, attempts: int = 30, delay_seconds: in
 async def _sync_guacamole_rdp_target(lab: Lab, windows_hostname: str | None = None) -> None:
     if not lab.guacamole_connection_id:
         return
-    hostname = await _reachable_rdp_host(lab, attempts=6, delay_seconds=5)
+    hostname = await _reachable_rdp_host(lab, attempts=30, delay_seconds=10)
     password = await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
     await GuacamoleService().update_rdp_connection(
         lab.guacamole_connection_id,
         hostname=hostname,
         username=_rdp_username(lab),
         password=password,
-        domain=windows_hostname,
+        domain=windows_hostname or ".",
     )
+
+
+async def _stable_rdp_host(lab: Lab) -> str:
+    guac_host = await _reachable_rdp_host(lab, attempts=_rdp_wait_attempts(lab), delay_seconds=10)
+    if lab.lab_type == "claude":
+        await asyncio.sleep(30)
+        if not await _can_reach_rdp(guac_host):
+            guac_host = await _reachable_rdp_host(lab, attempts=12, delay_seconds=10)
+    return guac_host
+
+
+async def _ensure_guacamole_access(
+    db: AsyncSession,
+    lab: Lab,
+    raw_password: str,
+    windows_hostname: str | None = None,
+    *,
+    rdp_host: str | None = None,
+) -> None:
+    guacamole = GuacamoleService()
+    guac_host = rdp_host or await _stable_rdp_host(lab)
+    db.add(AuditLog(actor="system", action="lab.rdp.ready", resource_id=lab.id, message=f"RDP is reachable on {guac_host}"))
+    await db.commit()
+
+    if lab.guacamole_connection_id:
+        await guacamole.update_rdp_connection(
+            lab.guacamole_connection_id,
+            hostname=guac_host,
+            username=_rdp_username(lab),
+            password=raw_password,
+            domain=windows_hostname or ".",
+        )
+        lab.access_url = lab.access_url or guacamole.access_url_for_connection(lab.guacamole_connection_id)
+    else:
+        instance_suffix = f"-{lab.ec2_instance_id[-6:]}" if lab.ec2_instance_id else ""
+        connection_id, access_url = await guacamole.create_rdp_connection(
+            name=f"{lab.owner_label}-{lab.id[:8]}{instance_suffix}",
+            hostname=guac_host,
+            username=_rdp_username(lab),
+            password=raw_password,
+            domain=windows_hostname or ".",
+        )
+        lab.guacamole_connection_id = connection_id
+        lab.access_url = access_url
+        await db.commit()
+
+    await guacamole.create_user_mapping(username=lab.username, password=raw_password, connection_id=lab.guacamole_connection_id)
+    lab.access_url = lab.access_url or guacamole.access_url_for_connection(lab.guacamole_connection_id)
 
 
 async def _delete_lab_password_secret(lab: Lab, errors: list[str] | None = None) -> None:
     try:
-        deleted = await delete_lab_password(lab.aws_region, lab.password_secret_ref)
+        deleted = await delete_lab_credential_artifacts(lab.aws_region, lab.id, lab.password_secret_ref)
         if deleted:
             lab.password_secret_ref = "deleted"
             lab.password_ciphertext = ""
@@ -223,10 +413,17 @@ async def _delete_lab_password_secret(lab: Lab, errors: list[str] | None = None)
 
 async def create_batch(db: AsyncSession, payload: BatchCreate, admin_id: str) -> Batch:
     settings = get_settings()
-    on_demand_hourly_cost = await get_hourly_windows_price(payload.aws_region, payload.instance_type, settings.pricing_cache_ttl_seconds)
-    spot_hourly_cost = await get_estimated_spot_windows_price(payload.aws_region, payload.instance_type, settings.pricing_cache_ttl_seconds)
-    requested_market = _requested_market(on_demand_hourly_cost, spot_hourly_cost)
-    hourly_cost = spot_hourly_cost if requested_market == "spot" and spot_hourly_cost is not None else on_demand_hourly_cost
+    claude_profiles: list[str] = []
+    if payload.lab_type == "claude":
+        if not settings.claude_profile_bucket:
+            raise RuntimeError("CLAUDE_PROFILE_BUCKET must be configured before launching Claude labs")
+        claude_profiles = await _available_claude_profiles(db)
+        if len(claude_profiles) < payload.user_count:
+            raise RuntimeError(f"Only {len(claude_profiles)} Claude profile(s) are available for {payload.user_count} requested lab(s)")
+    on_demand_hourly_cost = fallback_windows_price(payload.instance_type)
+    spot_hourly_cost = None
+    requested_market = "on-demand" if payload.lab_type == "claude" else _requested_market(on_demand_hourly_cost, spot_hourly_cost)
+    hourly_cost = on_demand_hourly_cost
     created_at = utcnow()
     if payload.schedule_enabled:
         expiry = _schedule_final_expiry(
@@ -254,6 +451,8 @@ async def create_batch(db: AsyncSession, payload: BatchCreate, admin_id: str) ->
             aws_region=payload.aws_region,
             instance_type=payload.instance_type,
             windows_ami=payload.windows_ami,
+            lab_type=payload.lab_type,
+            claude_profile_id=claude_profiles[index - 1] if payload.lab_type == "claude" else None,
             username=_lab_username(index, lab_id, created_at),
             password_secret_ref="pending",
             password_ciphertext=password,
@@ -279,10 +478,19 @@ async def create_batch(db: AsyncSession, payload: BatchCreate, admin_id: str) ->
     await db.commit()
 
     db.add(AuditLog(actor=admin_id, action="batch.created", resource_id=batch.id, message=f"Created {len(labs)} labs"))
-    await db.commit()
     for lab in labs:
+        db.add(
+            AuditLog(
+                actor="system",
+                action="lab.credentials.ready",
+                resource_id=lab.id,
+                message="Credentials are ready. Browser access will appear after Windows and Guacamole finish provisioning.",
+            )
+        )
+    await db.commit()
+    for position, lab in enumerate(labs):
         if lab.status == LabStatus.provisioning:
-            asyncio.create_task(provision_lab(lab.id))
+            _schedule_provision_lab(lab.id, position)
     return batch
 
 
@@ -293,31 +501,73 @@ async def provision_lab(lab_id: str) -> None:
         lab = await db.get(Lab, lab_id)
         if not lab:
             return
+        if lab.status != LabStatus.provisioning:
+            return
+        schedule_state = _schedule_state(lab, utcnow())
+        if schedule_state in {"before", "after_day"}:
+            _pause_provisioning_until_schedule(db, lab, schedule_state)
+            await db.commit()
+            return
+        if schedule_state == "after":
+            await terminate_lab(db, lab, CleanupReason.expiry)
+            return
         raw_password = (
-            await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
-            if lab.password_secret_ref.startswith("local-dev:")
-            else lab.password_ciphertext
+            lab.password_ciphertext
+            if lab.password_secret_ref == "pending"
+            else await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
         )
         try:
             secret_ref, stored_value = await store_lab_password(lab.aws_region, lab.id, raw_password)
             lab.password_secret_ref = secret_ref
             lab.password_ciphertext = stored_value
+            db.add(AuditLog(actor="system", action="lab.provision.started", resource_id=lab.id, message="Launching Windows EC2 instance"))
+            await db.commit()
+
+            if lab.lab_type == "claude":
+                await _require_fast_launch_ready(lab.aws_region, lab.windows_ami)
+                if lab.claude_profile_id:
+                    await _require_claude_profile_archives(lab.aws_region, [lab.claude_profile_id])
+
+            lab.on_demand_hourly_cost = await get_hourly_windows_price(lab.aws_region, lab.instance_type, get_settings().pricing_cache_ttl_seconds)
+            if lab.lab_type != "claude":
+                lab.spot_hourly_cost = await get_estimated_spot_windows_price(lab.aws_region, lab.instance_type, get_settings().pricing_cache_ttl_seconds)
+                lab.requested_instance_market = _requested_market(lab.on_demand_hourly_cost, lab.spot_hourly_cost)
+                lab.instance_market = lab.requested_instance_market
+                lab.hourly_cost = lab.spot_hourly_cost if lab.requested_instance_market == "spot" and lab.spot_hourly_cost is not None else lab.on_demand_hourly_cost
+            else:
+                lab.requested_instance_market = "on-demand"
+                lab.instance_market = "on-demand"
+                lab.hourly_cost = lab.on_demand_hourly_cost
             await db.commit()
 
             ec2 = AwsEc2Service(lab.aws_region)
-            instance = await ec2.launch_windows_instance(
-                ami_id=lab.windows_ami,
-                instance_type=lab.instance_type,
-                username=lab.username,
-                password=raw_password,
-                display_name=lab.owner_label,
-                batch_id=lab.batch_id,
-                lab_id=lab.id,
-                budget_limit=lab.budget_limit,
-                idle_timeout_minutes=lab.idle_timeout_minutes,
-                expiry_iso=lab.expiry_time.isoformat(),
-                instance_market=lab.requested_instance_market,
-            )
+            if lab.ec2_instance_id:
+                db.add(
+                    AuditLog(
+                        actor="system",
+                        action="lab.provision.resumed",
+                        resource_id=lab.id,
+                        message=f"Continuing provisioning for existing EC2 instance {lab.ec2_instance_id}",
+                    )
+                )
+                await db.commit()
+                instance = await ec2.start_instance(lab.ec2_instance_id, lab_id=lab.id)
+            else:
+                instance = await ec2.launch_windows_instance(
+                    ami_id=lab.windows_ami,
+                    instance_type=lab.instance_type,
+                    username=lab.username,
+                    password=raw_password,
+                    display_name=lab.owner_label,
+                    batch_id=lab.batch_id,
+                    lab_id=lab.id,
+                    budget_limit=lab.budget_limit,
+                    idle_timeout_minutes=lab.idle_timeout_minutes,
+                    expiry_iso=lab.expiry_time.isoformat(),
+                    instance_market=lab.requested_instance_market,
+                    lab_type=lab.lab_type,
+                    claude_profile_id=lab.claude_profile_id,
+                )
             lab.ec2_instance_id = instance.instance_id
             lab.instance_type = instance.instance_type or lab.instance_type
             lab.instance_market = instance.market
@@ -329,22 +579,53 @@ async def provision_lab(lab_id: str) -> None:
                     lab.hourly_cost = lab.spot_hourly_cost
             lab.private_ip = instance.private_ip
             lab.public_ip = instance.public_ip
+            db.add(
+                AuditLog(
+                    actor="system",
+                    action="lab.instance.running",
+                    resource_id=lab.id,
+                    message=f"EC2 instance {instance.instance_id} is running; checking RDP directly",
+                )
+            )
             await db.commit()
 
-            guac_host = await _reachable_rdp_host(lab)
-            connection_id, access_url = await GuacamoleService().create_rdp_connection(
-                name=f"{lab.owner_label}-{lab.id[:8]}",
-                hostname=guac_host,
-                username=_rdp_username(lab),
-                password=raw_password,
-                domain=instance.windows_hostname,
-            )
-            await GuacamoleService().create_user_mapping(username=lab.username, password=raw_password, connection_id=connection_id)
-            lab.guacamole_connection_id = connection_id
-            lab.access_url = access_url
+            if lab.lab_type == "claude":
+                rdp_host = await _stable_rdp_host(lab)
+                db.add(AuditLog(actor="system", action="lab.rdp.stable", resource_id=lab.id, message=f"RDP is stable on {rdp_host}; waiting for Claude Desktop"))
+                await db.commit()
+                db.add(
+                    AuditLog(
+                        actor="system",
+                        action="lab.claude.waiting",
+                        resource_id=lab.id,
+                        message="Waiting for Claude Desktop install/profile marker before exposing browser access",
+                    )
+                )
+                await db.commit()
+                await ec2.wait_claude_ready(instance.instance_id, max_attempts=60, delay_seconds=10)
+                db.add(AuditLog(actor="system", action="lab.claude.ready", resource_id=lab.id, message="Claude Desktop is installed and profile marker is ready"))
+                await db.commit()
+                await _ensure_guacamole_access(db, lab, raw_password, instance.windows_hostname, rdp_host=rdp_host)
+            else:
+                await _ensure_guacamole_access(db, lab, raw_password, instance.windows_hostname)
+            if await _provisioning_was_cancelled(db, lab):
+                return
+            ready_at = utcnow()
+            if not lab.schedule_enabled:
+                batch = await db.get(Batch, lab.batch_id)
+                if batch:
+                    lab.expiry_time = ready_at + timedelta(hours=batch.duration_hours)
+                    try:
+                        await ec2.update_instance_expiry_tag(
+                            instance.instance_id,
+                            lab_id=lab.id,
+                            expiry_iso=lab.expiry_time.isoformat(),
+                        )
+                    except Exception as exc:
+                        db.add(AuditLog(actor="system", action="lab.expiry_tag_failed", resource_id=lab.id, message=str(exc)))
             lab.status = LabStatus.running
-            lab.last_seen_at = utcnow()
-            lab.last_started_at = lab.last_seen_at
+            lab.last_seen_at = None
+            lab.last_started_at = ready_at
             db.add(
                 AuditLog(
                     actor="system",
@@ -355,11 +636,42 @@ async def provision_lab(lab_id: str) -> None:
             )
             await db.commit()
         except Exception as exc:
-            await _delete_lab_password_secret(lab)
+            await db.refresh(lab)
+            if lab.status != LabStatus.provisioning:
+                db.add(
+                    AuditLog(
+                        actor="system",
+                        action="lab.provision.cancelled",
+                        resource_id=lab.id,
+                        message=f"Provisioning failed after lab moved to {lab.status.value}; leaving current status unchanged: {exc}",
+                    )
+                )
+                await db.commit()
+                return
             lab.status = LabStatus.failed
             message = _provisioning_error_message(exc)
             db.add(AuditLog(actor="system", action="lab.failed", resource_id=lab.id, message=message))
             await db.commit()
+
+
+async def resume_pending_provisioning() -> int:
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as db:
+        rows = (
+            await db.scalars(
+                select(Lab).where(
+                    Lab.status == LabStatus.provisioning,
+                    visible_lab_filter(),
+                )
+            )
+        ).all()
+        for lab in rows:
+            db.add(AuditLog(actor="system", action="lab.provision.requeued", resource_id=lab.id, message="Requeued unfinished provisioning after backend startup"))
+        await db.commit()
+        for position, lab in enumerate(rows):
+            _schedule_provision_lab(lab.id, position)
+        return len(rows)
 
 
 def _provisioning_error_message(exc: Exception) -> str:
@@ -368,19 +680,61 @@ def _provisioning_error_message(exc: Exception) -> str:
     return str(exc)
 
 
+async def recover_failed_lab(db: AsyncSession, lab: Lab) -> None:
+    now = utcnow()
+    if lab.status != LabStatus.failed:
+        raise RuntimeError(f"Lab cannot be recovered from status {lab.status.value}")
+    if lab.schedule_enabled and _schedule_state(lab, now) != "active":
+        raise RuntimeError("Lab is outside the scheduled time window")
+    if not lab.ec2_instance_id:
+        raise RuntimeError("Lab has no EC2 instance to recover")
+    if _aware(lab.expiry_time) <= now:
+        await terminate_lab(db, lab, CleanupReason.expiry)
+        raise RuntimeError("Lab has expired")
+    if _budget_exhausted(lab, now):
+        lab.status = LabStatus.budget_exceeded
+        await db.commit()
+        raise RuntimeError("Lab budget has been exhausted")
+
+    raw_password = await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
+    lab.status = LabStatus.resuming
+    db.add(AuditLog(actor="system", action="lab.recover.started", resource_id=lab.id, message="Repairing EC2 and browser access for failed lab"))
+    await db.commit()
+    try:
+        instance = await AwsEc2Service(lab.aws_region).start_instance(lab.ec2_instance_id, lab_id=lab.id)
+        lab.private_ip = instance.private_ip
+        lab.public_ip = instance.public_ip
+        await _ensure_guacamole_access(db, lab, raw_password, instance.windows_hostname)
+        lab.status = LabStatus.running
+        lab.last_seen_at = None
+        lab.last_started_at = lab.last_started_at or utcnow()
+        db.add(AuditLog(actor="system", action="lab.recover.finished", resource_id=lab.id, message="Lab access repaired"))
+    except Exception as exc:
+        lab.status = LabStatus.failed
+        db.add(AuditLog(actor="system", action="lab.recover.failed", resource_id=lab.id, message=str(exc)))
+    await db.commit()
+
+
 async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> None:
-    if reason in {CleanupReason.budget, CleanupReason.idle}:
-        await stop_lab(db, lab, reason)
+    if lab.status in {LabStatus.terminated, LabStatus.expired, LabStatus.interrupted}:
+        errors: list[str] = []
+        await _delete_lab_password_secret(lab, errors)
+        if errors:
+            db.add(AuditLog(actor="system", action="lab.cleanup.credential_failed", resource_id=lab.id, message="; ".join(errors)))
+        await db.commit()
         return
 
-    if lab.status in {LabStatus.terminated, LabStatus.terminating, LabStatus.expired, LabStatus.interrupted}:
-        return
-    lab.status = LabStatus.terminating
+    now = utcnow()
+    if lab.status == LabStatus.running:
+        _accrue_running_time(lab, now)
+    if lab.status != LabStatus.terminating:
+        lab.status = LabStatus.terminating
     job = CleanupJob(lab_id=lab.id, reason=reason, status="running")
     db.add(job)
     await db.commit()
 
     errors: list[str] = []
+    critical_errors: list[str] = []
     if lab.guacamole_connection_id:
         try:
             await GuacamoleService().delete_connection(lab.guacamole_connection_id)
@@ -394,19 +748,36 @@ async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> No
         pass
     if lab.ec2_instance_id:
         try:
-            await AwsEc2Service(lab.aws_region).terminate_instance(lab.ec2_instance_id, lab_id=lab.id)
+            ec2 = AwsEc2Service(lab.aws_region)
+            await ec2.terminate_instance(lab.ec2_instance_id, lab_id=lab.id)
+            await ec2.delete_available_lab_volumes(lab_id=lab.id)
         except Exception as exc:
-            errors.append(f"ec2: {exc}")
-    if not errors:
-        await _delete_lab_password_secret(lab, errors)
+            error = f"ec2: {exc}"
+            errors.append(error)
+            if "was not found" not in str(exc):
+                critical_errors.append(error)
+    else:
+        try:
+            await AwsEc2Service(lab.aws_region).delete_available_lab_volumes(lab_id=lab.id)
+        except Exception as exc:
+            errors.append(f"volumes: {exc}")
+    await _delete_lab_password_secret(lab, critical_errors)
+    errors.extend(error for error in critical_errors if error not in errors)
 
-    lab.status = LabStatus.terminated if not errors else LabStatus.failed
+    lab.status = LabStatus.failed if critical_errors else LabStatus.terminated
     lab.terminated_at = utcnow()
-    job.status = "finished" if not errors else "failed"
+    job.status = "failed" if critical_errors else "finished"
     job.finished_at = utcnow()
     job.message = "; ".join(errors) if errors else "Cleanup completed"
     db.add(AuditLog(actor="system", action=f"lab.cleanup.{reason.value}", resource_id=lab.id, message=job.message))
     await db.commit()
+
+
+async def retry_terminating_labs(db: AsyncSession) -> int:
+    rows = (await db.scalars(select(Lab).where(Lab.status == LabStatus.terminating))).all()
+    for lab in rows:
+        await terminate_lab(db, lab, CleanupReason.force)
+    return len(rows)
 
 
 async def stop_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> None:
@@ -422,31 +793,12 @@ async def stop_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> None:
     errors: list[str] = []
     if lab.ec2_instance_id:
         try:
-            if _is_spot_lab(lab):
-                await AwsEc2Service(lab.aws_region).terminate_instance(lab.ec2_instance_id, lab_id=lab.id)
-            else:
-                await AwsEc2Service(lab.aws_region).stop_instance(lab.ec2_instance_id, lab_id=lab.id)
+            await AwsEc2Service(lab.aws_region).stop_instance(lab.ec2_instance_id, lab_id=lab.id)
         except Exception as exc:
             errors.append(f"ec2: {exc}")
 
     if errors:
         lab.status = LabStatus.failed
-    elif _is_spot_lab(lab):
-        if lab.guacamole_connection_id:
-            try:
-                await GuacamoleService().delete_connection(lab.guacamole_connection_id)
-                lab.guacamole_connection_id = None
-                lab.access_url = None
-            except Exception as exc:
-                errors.append(f"guacamole: {exc}")
-        try:
-            await GuacamoleService().delete_user(lab.username)
-        except Exception:
-            pass
-        if not errors:
-            await _delete_lab_password_secret(lab, errors)
-        lab.status = LabStatus.failed if errors else (LabStatus.interrupted if reason == CleanupReason.orphan else LabStatus.terminated)
-        lab.terminated_at = utcnow()
     elif reason == CleanupReason.budget:
         lab.status = LabStatus.budget_exceeded
     else:
@@ -454,8 +806,7 @@ async def stop_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> None:
 
     job.status = "finished" if not errors else "failed"
     job.finished_at = utcnow()
-    action = "terminated" if _is_spot_lab(lab) and not errors else "stopped"
-    job.message = "; ".join(errors) if errors else f"Instance {action} due to {reason.value}"
+    job.message = "; ".join(errors) if errors else f"Instance stopped due to {reason.value}"
     db.add(AuditLog(actor="system", action=f"lab.stop.{reason.value}", resource_id=lab.id, message=job.message))
     await db.commit()
 
@@ -482,8 +833,6 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
         return
     if lab.status != LabStatus.stopped:
         raise RuntimeError(f"Lab cannot be resumed from status {lab.status.value}")
-    if _is_spot_lab(lab):
-        raise RuntimeError("Spot labs cannot be resumed after stop or interruption")
     if _aware(lab.expiry_time) <= now:
         await terminate_lab(db, lab, CleanupReason.expiry)
         raise RuntimeError("Lab has expired")
@@ -507,9 +856,73 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
         lab.last_started_at = lab.last_seen_at
         db.add(AuditLog(actor="system", action="lab.resume.finished", resource_id=lab.id, message="Lab is running again"))
     except Exception as exc:
-        lab.status = LabStatus.stopped
-        db.add(AuditLog(actor="system", action="lab.resume.failed", resource_id=lab.id, message=str(exc)))
+        if _is_spot_lab(lab) and "IncorrectSpotRequestState" in str(exc):
+            db.add(
+                AuditLog(
+                    actor="system",
+                    action="lab.resume.spot_relaunch",
+                    resource_id=lab.id,
+                    message=f"Stopped Spot instance could not be started; relaunching Spot instance: {exc}",
+                )
+            )
+            await db.commit()
+            try:
+                raw_password = await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
+                await _relaunch_spot_lab_instance(db, lab, raw_password)
+            except Exception as relaunch_exc:
+                lab.status = LabStatus.stopped
+                db.add(AuditLog(actor="system", action="lab.resume.failed", resource_id=lab.id, message=str(relaunch_exc)))
+        else:
+            lab.status = LabStatus.stopped
+            db.add(AuditLog(actor="system", action="lab.resume.failed", resource_id=lab.id, message=str(exc)))
     await db.commit()
+
+
+async def _relaunch_spot_lab_instance(db: AsyncSession, lab: Lab, raw_password: str) -> None:
+    old_instance_id = lab.ec2_instance_id
+    ec2 = AwsEc2Service(lab.aws_region)
+    if old_instance_id:
+        try:
+            await ec2.terminate_instance(old_instance_id, lab_id=lab.id)
+        except Exception as exc:
+            db.add(AuditLog(actor="system", action="lab.resume.old_spot_cleanup_failed", resource_id=lab.id, message=str(exc)))
+            await db.commit()
+
+    instance = await ec2.launch_windows_instance(
+        ami_id=lab.windows_ami,
+        instance_type=lab.instance_type,
+        username=lab.username,
+        password=raw_password,
+        display_name=lab.owner_label,
+        batch_id=lab.batch_id,
+        lab_id=lab.id,
+        budget_limit=lab.budget_limit,
+        idle_timeout_minutes=lab.idle_timeout_minutes,
+        expiry_iso=lab.expiry_time.isoformat(),
+        instance_market="spot",
+        lab_type=lab.lab_type,
+        claude_profile_id=lab.claude_profile_id,
+    )
+    lab.ec2_instance_id = instance.instance_id
+    lab.instance_type = instance.instance_type or lab.instance_type
+    lab.instance_market = instance.market
+    lab.private_ip = instance.private_ip
+    lab.public_ip = instance.public_ip
+    db.add(
+        AuditLog(
+            actor="system",
+            action="lab.resume.spot_relaunched",
+            resource_id=lab.id,
+            message=f"Replaced stopped Spot instance {old_instance_id} with {instance.instance_id}",
+        )
+    )
+    await db.commit()
+
+    await _ensure_guacamole_access(db, lab, raw_password, instance.windows_hostname)
+    lab.status = LabStatus.running
+    lab.last_seen_at = utcnow()
+    lab.last_started_at = lab.last_seen_at
+    db.add(AuditLog(actor="system", action="lab.resume.finished", resource_id=lab.id, message="Lab is running again on a replacement Spot instance"))
 
 
 async def prepare_lab_session(db: AsyncSession, lab: Lab) -> None:
@@ -557,13 +970,6 @@ async def prepare_lab_session(db: AsyncSession, lab: Lab) -> None:
         await db.commit()
         raise RuntimeError("Lab instance has ended")
     if state in {"stopped", "stopping"}:
-        if _is_spot_lab(lab):
-            _accrue_running_time(lab, utcnow())
-            lab.status = LabStatus.interrupted
-            lab.interrupted_at = utcnow()
-            db.add(AuditLog(actor="system", action="lab.spot.interrupted", resource_id=lab.id, message="Spot lab instance stopped or was interrupted"))
-            await db.commit()
-            raise RuntimeError("Spot lab has ended")
         await resume_lab(db, lab)
         if lab.status != LabStatus.running:
             raise RuntimeError("Lab could not be started")
@@ -625,14 +1031,12 @@ async def find_due_labs(db: AsyncSession) -> list[tuple[Lab, CleanupReason]]:
                 continue
             if _is_spot_lab(lab) and state in {"stopped", "stopping"}:
                 _accrue_running_time(lab, now)
-                lab.status = LabStatus.interrupted
-                lab.interrupted_at = now
-                await _delete_lab_password_secret(lab)
-                db.add(AuditLog(actor="system", action="lab.spot.interrupted", resource_id=lab.id, message=f"EC2 Spot instance is {state}"))
+                lab.status = LabStatus.stopped
+                db.add(AuditLog(actor="system", action="lab.spot.stopped", resource_id=lab.id, message=f"EC2 Spot instance is {state}"))
                 await db.commit()
                 continue
         expiry_time = _aware(lab.expiry_time)
-        if expiry_time <= now:
+        if expiry_time <= now and lab.status not in {LabStatus.provisioning, LabStatus.resuming}:
             due.append((lab, CleanupReason.expiry))
         elif (
             lab.status in {LabStatus.running, LabStatus.provisioning, LabStatus.resuming}
@@ -662,7 +1066,7 @@ async def enforce_scheduled_labs(db: AsyncSession) -> None:
                 lab.status = LabStatus.provisioning
                 db.add(AuditLog(actor="system", action="lab.schedule.launch", resource_id=lab.id, message="Scheduled lab window started"))
                 await db.commit()
-                asyncio.create_task(provision_lab(lab.id))
+                _schedule_provision_lab(lab.id)
             elif lab.status == LabStatus.stopped and lab.ec2_instance_id:
                 db.add(AuditLog(actor="system", action="lab.schedule.resume", resource_id=lab.id, message="Scheduled lab window started"))
                 await db.commit()
@@ -711,6 +1115,13 @@ async def extend_lab(db: AsyncSession, lab: Lab, hours: float, admin_id: str) ->
     previous_expiry = _aware(lab.expiry_time)
     base_time = max(previous_expiry, now)
     lab.expiry_time = base_time + timedelta(hours=hours)
+    if lab.schedule_enabled and lab.schedule_start_date and lab.schedule_days:
+        local_tz = ZoneInfo(lab.schedule_timezone or "Asia/Kolkata")
+        local_expiry = lab.expiry_time.astimezone(local_tz)
+        extended_days = max((local_expiry.date() - lab.schedule_start_date).days + 1, lab.schedule_days)
+        lab.schedule_days = extended_days
+        if local_expiry.date() == lab.schedule_start_date + timedelta(days=extended_days - 1):
+            lab.schedule_end_time = local_expiry.strftime("%H:%M")
     if lab.status == LabStatus.expired and lab.ec2_instance_id:
         lab.status = LabStatus.stopped
     if lab.status == LabStatus.running:
@@ -752,6 +1163,17 @@ async def add_lab_budget_credit(db: AsyncSession, lab: Lab, amount: float, admin
     if lab.status == LabStatus.budget_exceeded:
         lab.status = LabStatus.stopped
     await db.commit()
+
+    if lab.ec2_instance_id:
+        try:
+            await AwsEc2Service(lab.aws_region).update_instance_budget_tag(
+                lab.ec2_instance_id,
+                lab_id=lab.id,
+                budget_limit=lab.budget_limit,
+            )
+        except Exception as exc:
+            db.add(AuditLog(actor="system", action="lab.budget.tag_failed", resource_id=lab.id, message=str(exc)))
+            await db.commit()
 
     if lab.status == LabStatus.stopped:
         await resume_lab(db, lab)

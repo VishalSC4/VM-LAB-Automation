@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import {
   Activity,
   AlertCircle,
@@ -30,12 +31,14 @@ import { api, AUTH_EXPIRED_EVENT, AuditLog, Dashboard, Lab, LabCredentialsExport
 
 const defaults = {
   name: "dev-lab",
+  lab_type: "windows",
   user_count: 1,
   duration_hours: 4,
+  duration_minutes: 0,
   budget_per_vm: 10,
   aws_region: "ap-south-1",
-  instance_type: "c6a.xlarge",
-  windows_ami: "ami-079ba093634ca5405",
+  instance_type: "t3a.xlarge",
+  windows_ami: "ami-06e8bc8e415e16e9f",
   idle_timeout_minutes: 60,
   schedule_enabled: false,
   schedule_start_date: new Date().toISOString().slice(0, 10),
@@ -44,6 +47,8 @@ const defaults = {
   schedule_end_time: "17:00",
   schedule_timezone: "Asia/Kolkata",
 };
+
+const scheduleTimeZones = ["Asia/Kolkata", "UTC", "America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London"] as const;
 
 function labAccessHref(accessUrl: string): string {
   try {
@@ -100,7 +105,42 @@ function elapsedPercent(lab: Lab): number {
 
 function scheduleLabel(lab: Lab): string {
   if (!lab.schedule_enabled) return "Any time";
-  return `${lab.schedule_start_time}-${lab.schedule_end_time} x ${lab.schedule_days}d`;
+  return `${lab.schedule_start_time}-${lab.schedule_end_time} ${lab.schedule_timezone} x ${lab.schedule_days}d`;
+}
+
+function addDaysToDateString(dateString: string, days: number): string {
+  const [year, month, day] = dateString.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+}
+
+function scheduleWindowLabel(lab: Lab): string {
+  if (!lab.schedule_enabled || !lab.schedule_start_date || !lab.schedule_days) return "Any time";
+  const endDate = addDaysToDateString(lab.schedule_start_date, lab.schedule_days - 1);
+  return `${lab.schedule_start_date} - ${endDate}`;
+}
+
+function scheduleStateLabel(lab: Lab, nowMs: number): string {
+  if (!lab.schedule_enabled || !lab.schedule_start_date || !lab.schedule_start_time || !lab.schedule_end_time) return "Available";
+  const timeZone = lab.schedule_timezone || "Asia/Kolkata";
+  const localParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(nowMs));
+  const part = (type: string) => localParts.find((item) => item.type === type)?.value ?? "";
+  const localDate = `${part("year")}-${part("month")}-${part("day")}`;
+  const localTime = `${part("hour")}:${part("minute")}`;
+  const endDate = addDaysToDateString(lab.schedule_start_date, (lab.schedule_days ?? 1) - 1);
+  if (localDate < lab.schedule_start_date) return "Waiting for first scheduled day";
+  if (localDate > endDate) return "Schedule ended";
+  if (localTime < lab.schedule_start_time) return "Starts later today";
+  if (localTime >= lab.schedule_end_time) return localDate < endDate ? "Done for today" : "Schedule ended";
+  return "Inside scheduled window";
 }
 
 function cardTone(status: string): string {
@@ -122,9 +162,15 @@ function statusTone(status: string): string {
 function progressSteps(lab: Lab): string[] {
   const steps = [
     lab.ec2_instance_id ? "EC2 ready" : "Creating EC2",
+    lab.username ? "Credentials ready" : "Creating credentials",
     lab.private_ip ? "Network ready" : "Waiting network",
-    lab.access_url ? "Access ready" : "Preparing access",
   ];
+  if (lab.status === "provisioning" && lab.ec2_instance_id && !lab.access_url) {
+    steps.push("Windows first boot");
+    steps.push("Waiting for RDP");
+  } else {
+    steps.push(lab.access_url ? "Browser access ready" : "Preparing access");
+  }
   if (lab.status === "running") steps.push("Running");
   if (lab.status === "stopped") steps.push("Stopped");
   if (lab.status === "failed") steps.push("Failed");
@@ -144,7 +190,9 @@ function viewMatchesLab(view: string, lab: Lab): boolean {
 }
 
 export default function Home() {
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken] = useState<string | null>(() =>
+    typeof window === "undefined" ? null : localStorage.getItem("cloudlab_token")
+  );
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [form, setForm] = useState(defaults);
@@ -152,6 +200,7 @@ export default function Home() {
   const [labs, setLabs] = useState<Lab[]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [credentials, setCredentials] = useState<Record<string, string>>({});
+  const [credentialDetails, setCredentialDetails] = useState<Record<string, { url: string | null; username: string; password: string; expires_at: string }>>({});
   const [creditInputs, setCreditInputs] = useState<Record<string, string>>({});
   const [extendInputs, setExtendInputs] = useState<Record<string, string>>({});
   const [credentialExportStatus, setCredentialExportStatus] = useState("");
@@ -182,7 +231,7 @@ export default function Home() {
       const matchesFilter = viewMatchesLab(labFilter, lab);
       const matchesQuery =
         !normalizedQuery ||
-        [lab.owner_label, lab.username, lab.instance_type, lab.instance_market, lab.aws_region, lab.ec2_instance_id ?? "", lab.private_ip ?? ""]
+        [lab.owner_label, lab.username, lab.lab_type, lab.claude_profile_id ?? "", lab.instance_type, lab.instance_market, lab.aws_region, lab.ec2_instance_id ?? "", lab.private_ip ?? ""]
           .join(" ")
           .toLowerCase()
           .includes(normalizedQuery);
@@ -207,7 +256,7 @@ export default function Home() {
     }
   }
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setRefreshing(true);
     setError("");
     try {
@@ -224,14 +273,16 @@ export default function Home() {
     } finally {
       setRefreshing(false);
     }
-  }
+  }, []);
 
   async function createBatch() {
     setBusy(true);
     setError("");
     try {
+      const { duration_minutes, ...batchForm } = form;
       const payload = {
-        ...form,
+        ...batchForm,
+        duration_hours: Number(form.duration_hours) + Number(duration_minutes) / 60,
         schedule_start_date: form.schedule_enabled ? form.schedule_start_date : null,
         schedule_days: form.schedule_enabled ? form.schedule_days : null,
         schedule_start_time: form.schedule_enabled ? form.schedule_start_time : null,
@@ -319,11 +370,17 @@ export default function Home() {
   }
 
   async function copyCredentials(id: string) {
-    const result = await api<{ url: string | null; username: string; password: string; expires_at: string }>(`/labs/${id}/credentials`);
+    const result = await showCredentials(id);
     const url = result.url ? labAccessHref(result.url) : null;
     const text = `URL: ${url}\nUsername: ${result.username}\nPassword: ${result.password}\nExpires: ${result.expires_at}`;
     await navigator.clipboard.writeText(text);
     setCredentials({ ...credentials, [id]: "Copied" });
+  }
+
+  async function showCredentials(id: string) {
+    const result = await api<{ url: string | null; username: string; password: string; expires_at: string }>(`/labs/${id}/credentials`);
+    setCredentialDetails((current) => ({ ...current, [id]: result }));
+    return result;
   }
 
   async function recentCredentialsText(): Promise<LabCredentialsExport> {
@@ -417,11 +474,6 @@ export default function Home() {
   }
 
   useEffect(() => {
-    const saved = localStorage.getItem("cloudlab_token");
-    if (saved) setToken(saved);
-  }, []);
-
-  useEffect(() => {
     function expireSession() {
       setToken(null);
       setDashboard(null);
@@ -436,10 +488,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!token) return;
-    refresh();
-    const timer = setInterval(refresh, 15000);
-    return () => clearInterval(timer);
-  }, [token]);
+    const initialTimer = setTimeout(() => void refresh(), 0);
+    const timer = setInterval(() => void refresh(), 15000);
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(timer);
+    };
+  }, [refresh, token]);
 
   useEffect(() => {
     const timer = setInterval(() => setNowMs(Date.now()), 1000);
@@ -477,7 +532,7 @@ export default function Home() {
             <section className="auth-panel p-6 sm:p-8">
               <div className="mb-8 flex items-center justify-between gap-4">
                 <div className="brand-tile h-14 w-32">
-                  <img src="/unext-logo.jpeg" alt="UNext" className="max-h-10 w-auto object-contain" />
+                  <Image src="/unext-logo.jpeg" alt="UNext" width={128} height={40} className="max-h-10 w-auto object-contain" priority />
                 </div>
                 <div className="icon-badge">
                   <Shield className="h-5 w-5" />
@@ -565,7 +620,7 @@ export default function Home() {
         <div className="mx-auto flex max-w-[1480px] items-center justify-between px-4 py-3 sm:px-5">
           <div className="flex items-center gap-3">
             <div className="brand-tile h-11 w-24">
-              <img src="/unext-logo.jpeg" alt="UNext" className="max-h-9 w-auto object-contain" />
+              <Image src="/unext-logo.jpeg" alt="UNext" width={96} height={36} className="max-h-9 w-auto object-contain" />
             </div>
             <div>
               <h1 className="text-base font-black text-ink sm:text-xl">Cloud Lab Platform</h1>
@@ -667,6 +722,8 @@ export default function Home() {
                       <span className={statusTone(lab.status)}>{lab.status}</span>
                       <div className="lab-row-facts">
                         <span><Cpu className="h-3.5 w-3.5" /> {lab.instance_type}</span>
+                        <span><Server className="h-3.5 w-3.5" /> {lab.lab_type === "claude" ? "Claude" : "Windows"}</span>
+                        {lab.claude_profile_id && <span><KeyRound className="h-3.5 w-3.5" /> {lab.claude_profile_id}</span>}
                         <span><Zap className="h-3.5 w-3.5" /> {lab.instance_market === "spot" ? "Spot" : "On-Demand"}</span>
                         <span><Clock className="h-3.5 w-3.5" /> {remainingTime(lab)}</span>
                         <span className={lab.status === "running" ? "live-cost-chip" : ""}><DollarSign className="h-3.5 w-3.5" /> ${spend.toFixed(3)} spent</span>
@@ -677,10 +734,11 @@ export default function Home() {
                             <ExternalLink className="h-4 w-4" /> Open
                           </a>
                         ) : (
-                          <span className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-bold text-slate-500">Access pending</span>
+                          <span className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-bold text-slate-500">{lab.ec2_instance_id ? "Windows booting" : "Access pending"}</span>
                         )}
-                        <button className="mini-button-3d" onClick={() => startLab(lab.id)} disabled={busy || lab.status !== "stopped"}><Play className="h-4 w-4" /> Start</button>
+                        <button className="mini-button-3d" onClick={() => startLab(lab.id)} disabled={busy || (lab.status !== "stopped" && !(lab.status === "failed" && lab.ec2_instance_id))}><Play className="h-4 w-4" /> {lab.status === "failed" ? "Repair" : "Start"}</button>
                         <button className="mini-button-3d" onClick={() => stopLab(lab.id)} disabled={busy || lab.status !== "running"}><Square className="h-4 w-4" /> Stop</button>
+                        <button className="mini-button-3d" onClick={() => showCredentials(lab.id)} disabled={lab.status === "terminated" || lab.status === "terminating"}><KeyRound className="h-4 w-4" /> Show</button>
                         <button className="mini-button-3d" onClick={() => copyCredentials(lab.id)}><Copy className="h-4 w-4" /> {credentials[lab.id] ?? "Copy"}</button>
                       </div>
                       <button className="icon-button-3d h-10 w-10 text-red-600" title="Force terminate" onClick={() => terminate(lab.id)}><Trash2 className="h-4 w-4" /></button>
@@ -689,6 +747,8 @@ export default function Home() {
                         <div className="lab-details-body">
                           <div className="grid gap-3 sm:grid-cols-3">
                             <div className="lab-stat"><Cpu className="h-4 w-4" /><span>Instance</span><strong>{lab.instance_type}</strong></div>
+                            <div className="lab-stat"><Server className="h-4 w-4" /><span>Lab type</span><strong>{lab.lab_type === "claude" ? "Claude Desktop" : "Windows"}</strong></div>
+                            {lab.claude_profile_id && <div className="lab-stat"><KeyRound className="h-4 w-4" /><span>Claude profile</span><strong>{lab.claude_profile_id}</strong></div>}
                             <div className="lab-stat"><Zap className="h-4 w-4" /><span>Market</span><strong>{lab.instance_market === "spot" ? "Spot" : "On-Demand"}</strong></div>
                             <div className="lab-stat"><Clock className="h-4 w-4" /><span>Runtime</span><strong>{runtimeLabel(runtime)}</strong></div>
                             <div className="lab-stat"><DollarSign className="h-4 w-4" /><span>Cost/hr</span><strong>${lab.hourly_cost.toFixed(3)}</strong></div>
@@ -696,7 +756,13 @@ export default function Home() {
                               <div className="lab-stat"><DollarSign className="h-4 w-4" /><span>Spot estimate</span><strong>${lab.spot_hourly_cost.toFixed(3)} vs ${lab.on_demand_hourly_cost.toFixed(3)}/h</strong></div>
                             )}
                             <div className="lab-stat"><WalletCards className="h-4 w-4" /><span>Live spend</span><strong>${spend.toFixed(4)}</strong></div>
-                            {lab.schedule_enabled && <div className="lab-stat sm:col-span-3"><CalendarDays className="h-4 w-4" /><span>Schedule</span><strong>{scheduleLabel(lab)}</strong></div>}
+                            {lab.schedule_enabled && (
+                              <>
+                                <div className="lab-stat sm:col-span-2"><CalendarDays className="h-4 w-4" /><span>Schedule</span><strong>{scheduleLabel(lab)}</strong></div>
+                                <div className="lab-stat"><Clock className="h-4 w-4" /><span>Window</span><strong>{scheduleWindowLabel(lab)}</strong></div>
+                                <div className="lab-stat"><Activity className="h-4 w-4" /><span>Schedule state</span><strong>{scheduleStateLabel(lab, nowMs)}</strong></div>
+                              </>
+                            )}
                           </div>
                           <div className="mt-3 grid gap-3 lg:grid-cols-2">
                             <div>
@@ -715,6 +781,19 @@ export default function Home() {
                           <div className="mt-3 flex flex-wrap gap-1.5">
                             {progressSteps(lab).map((step) => <span key={step} className="progress-chip">{step}</span>)}
                           </div>
+                          {credentialDetails[lab.id] && (
+                            <div className="mt-3 grid gap-2 rounded-lg border border-orange-100 bg-white p-3 text-sm">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <strong className="text-ink">Credentials</strong>
+                                <span className="text-xs font-bold text-slate-500">{credentialDetails[lab.id].url ? "Access ready" : "Access still provisioning"}</span>
+                              </div>
+                              <div className="grid gap-2 md:grid-cols-3">
+                                <div className="min-w-0"><p className="text-xs font-bold uppercase text-slate-500">URL</p><p className="truncate font-semibold">{credentialDetails[lab.id].url ? labAccessHref(credentialDetails[lab.id].url!) : "Pending"}</p></div>
+                                <div className="min-w-0"><p className="text-xs font-bold uppercase text-slate-500">Username</p><p className="truncate font-semibold">{credentialDetails[lab.id].username}</p></div>
+                                <div className="min-w-0"><p className="text-xs font-bold uppercase text-slate-500">Password</p><p className="truncate font-semibold">{credentialDetails[lab.id].password || "Deleted after termination"}</p></div>
+                              </div>
+                            </div>
+                          )}
                           <div className="mt-3 grid gap-2 sm:grid-cols-2">
                             <div className="quick-input">
                               <input type="number" min="0.01" step="0.01" placeholder="Budget credit" value={creditInputs[lab.id] ?? ""} onChange={(e) => setCreditInputs({ ...creditInputs, [lab.id]: e.target.value })} />
@@ -755,7 +834,6 @@ export default function Home() {
                   {[
                     ["name", "Batch name"],
                     ["user_count", "Users"],
-                    ["duration_hours", "Duration hours"],
                     ["budget_per_vm", "Budget per VM"],
                   ].map(([key, label]) => (
                     <label key={key} className="form-label">
@@ -767,6 +845,52 @@ export default function Home() {
                       />
                     </label>
                   ))}
+                  <label className="form-label">
+                    Duration hours
+                    <input
+                      className="field-3d mt-1.5 w-full"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={form.duration_hours}
+                      onChange={(e) => setForm({ ...form, duration_hours: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label className="form-label">
+                    Duration minutes
+                    <input
+                      className="field-3d mt-1.5 w-full"
+                      type="number"
+                      min="0"
+                      max="59"
+                      step="5"
+                      value={form.duration_minutes}
+                      onChange={(e) => setForm({ ...form, duration_minutes: Math.min(Math.max(Number(e.target.value), 0), 59) })}
+                    />
+                  </label>
+                </div>
+              </div>
+              <div className="launch-card">
+                <h2>Lab Type</h2>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <button
+                    className={form.lab_type === "windows" ? "choice-tile choice-tile-active" : "choice-tile"}
+                    onClick={() => setForm({ ...form, lab_type: "windows", name: form.name === "claude-lab" ? "dev-lab" : form.name })}
+                    type="button"
+                  >
+                    <Server className="h-5 w-5" />
+                    <span>Windows Lab</span>
+                    <small>Standard reusable Windows workspace</small>
+                  </button>
+                  <button
+                    className={form.lab_type === "claude" ? "choice-tile choice-tile-active" : "choice-tile"}
+                    onClick={() => setForm({ ...form, lab_type: "claude", name: form.name === "dev-lab" ? "claude-lab" : form.name, instance_type: "t3a.large" })}
+                    type="button"
+                  >
+                    <KeyRound className="h-5 w-5" />
+                    <span>Claude Lab</span>
+                    <small>Inject one stored Claude profile per VM</small>
+                  </button>
                 </div>
               </div>
               <div className="launch-card">
@@ -799,7 +923,7 @@ export default function Home() {
                   </label>
                 </div>
                 {form.schedule_enabled ? (
-                  <div className="mt-3 grid gap-3 sm:grid-cols-4">
+                  <div className="mt-3 grid gap-3 sm:grid-cols-5">
                     <label className="form-label">
                       Start date
                       <input className="field-3d mt-1.5 w-full" type="date" value={form.schedule_start_date} onChange={(e) => setForm({ ...form, schedule_start_date: e.target.value })} />
@@ -815,6 +939,14 @@ export default function Home() {
                     <label className="form-label">
                       End time
                       <input className="field-3d mt-1.5 w-full" type="time" value={form.schedule_end_time} onChange={(e) => setForm({ ...form, schedule_end_time: e.target.value })} />
+                    </label>
+                    <label className="form-label">
+                      Timezone
+                      <select className="field-3d mt-1.5 w-full" value={form.schedule_timezone} onChange={(e) => setForm({ ...form, schedule_timezone: e.target.value })}>
+                        {scheduleTimeZones.map((timezone) => (
+                          <option key={timezone} value={timezone}>{timezone}</option>
+                        ))}
+                      </select>
                     </label>
                   </div>
                 ) : (

@@ -9,7 +9,10 @@
         "ec2:DescribeImages",
         "ec2:DescribeSubnets",
         "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeFastLaunchImages",
         "ec2:DescribeSpotPriceHistory",
+        "ec2:GetConsoleOutput",
         "pricing:GetProducts"
       ],
       "Resource": "*"
@@ -30,7 +33,9 @@
       "Action": [
         "ec2:StartInstances",
         "ec2:StopInstances",
-        "ec2:TerminateInstances"
+        "ec2:TerminateInstances",
+        "ec2:CancelSpotInstanceRequests",
+        "ec2:DeleteVolume"
       ],
       "Resource": "*",
       "Condition": {
@@ -43,11 +48,41 @@
       "Sid": "LabSecrets",
       "Effect": "Allow",
       "Action": [
+        "secretsmanager:ListSecrets",
         "secretsmanager:CreateSecret",
         "secretsmanager:GetSecretValue",
         "secretsmanager:DeleteSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:*:*:secret:cloudlabs/*"
+      "Resource": "*"
+    },
+    {
+      "Sid": "LabSsmCleanup",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParametersByPath",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters"
+      ],
+      "Resource": "arn:aws:ssm:*:*:parameter/cloudlabs/*"
+    },
+    {
+      "Sid": "ClaudeReadinessChecks",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:DescribeInstanceInformation",
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ClaudeProfilePreflight",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::YOUR_CLAUDE_PROFILE_BUCKET/claude-profiles/*"
     },
     {
       "Sid": "PassLabInstanceProfile",

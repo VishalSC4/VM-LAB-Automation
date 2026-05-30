@@ -1,13 +1,20 @@
+import asyncio
+
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
+from urllib.parse import quote
 
 from app.core.config import get_settings
+
+
+_GUACAMOLE_WRITE_SEMAPHORE = asyncio.Semaphore(5)
 
 
 class GuacamoleService:
     def __init__(self):
         self.settings = get_settings()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def _token(self) -> str:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -16,6 +23,10 @@ class GuacamoleService:
             )
             response.raise_for_status()
             return response.json()["authToken"]
+
+    def access_url_for_connection(self, connection_id: str) -> str:
+        public_url = self.settings.guacamole_public_url.rstrip("/")
+        return f"{public_url}/session/{connection_id}" if public_url else f"/session/{connection_id}"
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def create_rdp_connection(
@@ -46,18 +57,18 @@ class GuacamoleService:
         if domain:
             payload["parameters"]["domain"] = domain
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections",
-                params={"token": token},
-                json=payload,
-            )
-            response.raise_for_status()
-            connection_id = str(response.json()["identifier"])
-        public_url = self.settings.guacamole_public_url.rstrip("/")
-        access_url = f"{public_url}/session/{connection_id}" if public_url else f"/session/{connection_id}"
-        return connection_id, access_url
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections",
+                    params={"token": token},
+                    json=payload,
+                )
+                response.raise_for_status()
+                connection_id = str(response.json()["identifier"])
+        return connection_id, self.access_url_for_connection(connection_id)
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def update_rdp_connection(
         self,
         connection_id: str,
@@ -69,81 +80,101 @@ class GuacamoleService:
     ) -> None:
         token = await self._token()
         url = f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections/{connection_id}"
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(url, params={"token": token})
-            response.raise_for_status()
-            current = response.json()
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(url, params={"token": token})
+                response.raise_for_status()
+                current = response.json()
 
-            payload = {
-                "parentIdentifier": current.get("parentIdentifier") or "ROOT",
-                "name": current.get("name") or connection_id,
-                "protocol": "rdp",
-                "parameters": {
-                    **(current.get("parameters") or {}),
-                    "hostname": hostname,
-                    "port": "3389",
-                    "username": username,
-                    "password": password,
-                    "security": "nla",
-                    "ignore-cert": "true",
-                    "enable-drive": "false",
-                },
-                "attributes": current.get("attributes") or {"max-connections": "1", "max-connections-per-user": "1"},
-            }
-            if domain:
-                payload["parameters"]["domain"] = domain
-            else:
-                payload["parameters"].pop("domain", None)
+                payload = {
+                    "parentIdentifier": current.get("parentIdentifier") or "ROOT",
+                    "name": current.get("name") or connection_id,
+                    "protocol": "rdp",
+                    "parameters": {
+                        **(current.get("parameters") or {}),
+                        "hostname": hostname,
+                        "port": "3389",
+                        "username": username,
+                        "password": password,
+                        "security": "nla",
+                        "ignore-cert": "true",
+                        "enable-drive": "false",
+                    },
+                    "attributes": current.get("attributes") or {"max-connections": "1", "max-connections-per-user": "1"},
+                }
+                if domain:
+                    payload["parameters"]["domain"] = domain
+                else:
+                    payload["parameters"].pop("domain", None)
 
-            update_response = await client.put(url, params={"token": token}, json=payload)
-            update_response.raise_for_status()
+                update_response = await client.put(url, params={"token": token}, json=payload)
+                update_response.raise_for_status()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def create_user_mapping(self, *, username: str, password: str, connection_id: str) -> None:
         token = await self._token()
+        encoded_username = quote(username, safe="")
         user_payload = {
             "username": username,
             "password": password,
             "attributes": {"disabled": "", "expired": "", "access-window-start": "", "access-window-end": ""},
         }
-        async with httpx.AsyncClient(timeout=20) as client:
-            user_response = await client.post(
-                f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users",
-                params={"token": token},
-                json=user_payload,
-            )
-            if user_response.status_code in {400, 409}:
-                user_response = await client.put(
-                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{username}",
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                user_response = await client.post(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users",
                     params={"token": token},
                     json=user_payload,
                 )
-            if user_response.status_code not in {200, 204}:
-                user_response.raise_for_status()
+                if user_response.status_code in {400, 409}:
+                    user_response = await client.put(
+                        f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{encoded_username}",
+                        params={"token": token},
+                        json=user_payload,
+                    )
+                if user_response.status_code not in {200, 201, 204}:
+                    user_response.raise_for_status()
 
-            patch = [{"op": "add", "path": f"/connectionPermissions/{connection_id}", "value": "READ"}]
-            permission_response = await client.patch(
-                f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{username}/permissions",
-                params={"token": token},
-                json=patch,
-            )
-            permission_response.raise_for_status()
+                patch = [{"op": "add", "path": f"/connectionPermissions/{connection_id}", "value": "READ"}]
+                permission_response = await client.patch(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{encoded_username}/permissions",
+                    params={"token": token},
+                    json=patch,
+                )
+                if permission_response.status_code in {400, 409}:
+                    permission_response = await client.patch(
+                        f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{encoded_username}/permissions",
+                        params={"token": token},
+                        json=[{"op": "replace", "path": f"/connectionPermissions/{connection_id}", "value": "READ"}],
+                    )
+                permission_response.raise_for_status()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def delete_connection(self, connection_id: str) -> None:
         token = await self._token()
-        async with httpx.AsyncClient(timeout=20) as client:
-            await client.delete(
-                f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections/{connection_id}",
-                params={"token": token},
-            )
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.delete(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections/{connection_id}",
+                    params={"token": token},
+                )
+                if response.status_code != 404:
+                    response.raise_for_status()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def delete_user(self, username: str) -> None:
         token = await self._token()
-        async with httpx.AsyncClient(timeout=20) as client:
-            await client.delete(
-                f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{username}",
-                params={"token": token},
-            )
+        encoded_username = quote(username, safe="")
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.delete(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/users/{encoded_username}",
+                    params={"token": token},
+                )
+                if response.status_code != 404:
+                    response.raise_for_status()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def active_connection_ids(self) -> set[str]:
         token = await self._token()
         async with httpx.AsyncClient(timeout=20) as client:

@@ -27,6 +27,7 @@ async def init_db() -> None:
         await conn.run_sync(_ensure_lab_runtime_columns)
         await conn.run_sync(_ensure_schedule_columns)
         await conn.run_sync(_ensure_spot_columns)
+        await conn.run_sync(_ensure_lab_type_columns)
         if engine.dialect.name == "postgresql":
             await conn.execute(text("ALTER TYPE labstatus ADD VALUE IF NOT EXISTS 'scheduled'"))
             await conn.execute(text("ALTER TYPE labstatus ADD VALUE IF NOT EXISTS 'stopped'"))
@@ -79,3 +80,13 @@ def _ensure_spot_columns(sync_conn) -> None:
     for name, definition in spot_columns:
         if name not in columns:
             sync_conn.execute(text(f"ALTER TABLE labs ADD COLUMN {name} {definition}"))
+
+
+def _ensure_lab_type_columns(sync_conn) -> None:
+    for table in ["batches", "labs"]:
+        columns = {column["name"] for column in inspect(sync_conn).get_columns(table)}
+        if "lab_type" not in columns:
+            sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN lab_type VARCHAR(40) DEFAULT 'windows'"))
+    lab_columns = {column["name"] for column in inspect(sync_conn).get_columns("labs")}
+    if "claude_profile_id" not in lab_columns:
+        sync_conn.execute(text("ALTER TABLE labs ADD COLUMN claude_profile_id VARCHAR(120)"))
