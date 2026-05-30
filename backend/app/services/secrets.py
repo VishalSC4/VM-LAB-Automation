@@ -13,7 +13,29 @@ LAB_SSM_PREFIX = "/cloudlabs/"
 
 
 async def store_lab_password(region: str, lab_id: str, password: str) -> tuple[str, str]:
-    return f"{LOCAL_DB_PREFIX}{lab_id}/windows-password", base64.b64encode(password.encode()).decode()
+    name = f"{LAB_SECRET_PREFIX}{lab_id}/windows-password"
+    client = boto3.client("secretsmanager", region_name=region, config=AWS_CLIENT_CONFIG)
+    try:
+        await asyncio.to_thread(
+            client.create_secret,
+            Name=name,
+            SecretString=password,
+            Tags=[
+                {"Key": "Project", "Value": "cloud-lab-platform"},
+                {"Key": "LabId", "Value": lab_id},
+            ],
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        message = exc.response.get("Error", {}).get("Message", "")
+        if code == "ResourceExistsException":
+            await asyncio.to_thread(client.put_secret_value, SecretId=name, SecretString=password)
+        elif code == "InvalidRequestException" and "scheduled for deletion" in message:
+            await asyncio.to_thread(client.restore_secret, SecretId=name)
+            await asyncio.to_thread(client.put_secret_value, SecretId=name, SecretString=password)
+        else:
+            raise
+    return name, ""
 
 
 async def get_lab_password(region: str, secret_ref: str, ciphertext: str) -> str:

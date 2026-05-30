@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import RetryError
 
@@ -391,6 +391,15 @@ async def _clear_missing_guacamole_connection(db: AsyncSession, lab: Lab, missin
     await db.commit()
 
 
+def _guacamole_connection_name_prefix(lab: Lab) -> str:
+    return f"{lab.owner_label}-{lab.id[:8]}"
+
+
+def _guacamole_connection_name(lab: Lab) -> str:
+    instance_suffix = f"-{lab.ec2_instance_id[-6:]}" if lab.ec2_instance_id else ""
+    return f"{_guacamole_connection_name_prefix(lab)}{instance_suffix}"
+
+
 async def _sync_guacamole_rdp_target(db: AsyncSession, lab: Lab, windows_hostname: str | None = None) -> None:
     if not lab.guacamole_connection_id:
         return
@@ -448,9 +457,9 @@ async def _ensure_guacamole_access(
             await _clear_missing_guacamole_connection(db, lab, exc.connection_id)
 
     if not lab.guacamole_connection_id:
-        instance_suffix = f"-{lab.ec2_instance_id[-6:]}" if lab.ec2_instance_id else ""
+        await guacamole.delete_connections_by_name_prefix(_guacamole_connection_name_prefix(lab))
         connection_id, access_url = await guacamole.create_rdp_connection(
-            name=f"{lab.owner_label}-{lab.id[:8]}{instance_suffix}",
+            name=_guacamole_connection_name(lab),
             hostname=guac_host,
             username=_rdp_username(lab),
             password=raw_password,
@@ -467,12 +476,39 @@ async def _ensure_guacamole_access(
 async def _delete_lab_password_secret(lab: Lab, errors: list[str] | None = None) -> None:
     try:
         deleted = await delete_lab_credential_artifacts(lab.aws_region, lab.id, lab.password_secret_ref)
-        if deleted:
-            lab.password_secret_ref = "deleted"
-            lab.password_ciphertext = ""
+        lab.password_secret_ref = "deleted"
+        lab.password_ciphertext = ""
     except Exception as exc:
+        lab.password_ciphertext = ""
         if errors is not None:
             errors.append(f"secret: {exc}")
+
+
+async def _delete_lab_access_artifacts(lab: Lab, errors: list[str] | None = None) -> None:
+    guacamole = GuacamoleService()
+    if lab.guacamole_connection_id:
+        try:
+            await guacamole.delete_connection(lab.guacamole_connection_id)
+            lab.guacamole_connection_id = None
+            lab.access_url = None
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"guacamole connection: {exc}")
+    try:
+        deleted_connections = await guacamole.delete_connections_by_name_prefix(_guacamole_connection_name_prefix(lab))
+        if deleted_connections:
+            lab.guacamole_connection_id = None
+            lab.access_url = None
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"duplicate guacamole cleanup: {exc}")
+    try:
+        await guacamole.delete_user(lab.username)
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"guacamole user: {exc}")
+    if not lab.guacamole_connection_id:
+        lab.access_url = None
 
 
 async def create_batch(db: AsyncSession, payload: BatchCreate, admin_id: str) -> Batch:
@@ -782,9 +818,12 @@ async def recover_failed_lab(db: AsyncSession, lab: Lab) -> None:
 async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> None:
     if lab.status in {LabStatus.terminated, LabStatus.expired, LabStatus.interrupted}:
         errors: list[str] = []
+        await _delete_lab_access_artifacts(lab, errors)
         await _delete_lab_password_secret(lab, errors)
         if errors:
-            db.add(AuditLog(actor="system", action="lab.cleanup.credential_failed", resource_id=lab.id, message="; ".join(errors)))
+            db.add(AuditLog(actor="system", action="lab.cleanup.residual_failed", resource_id=lab.id, message="; ".join(errors)))
+        else:
+            db.add(AuditLog(actor="system", action="lab.cleanup.residual", resource_id=lab.id, message="Residual lab access artifacts are cleaned"))
         await db.commit()
         return
 
@@ -799,17 +838,7 @@ async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> No
 
     errors: list[str] = []
     critical_errors: list[str] = []
-    if lab.guacamole_connection_id:
-        try:
-            await GuacamoleService().delete_connection(lab.guacamole_connection_id)
-            lab.guacamole_connection_id = None
-            lab.access_url = None
-        except Exception as exc:
-            errors.append(f"guacamole: {exc}")
-    try:
-        await GuacamoleService().delete_user(lab.username)
-    except Exception:
-        pass
+    await _delete_lab_access_artifacts(lab, errors)
     if lab.ec2_instance_id:
         try:
             ec2 = AwsEc2Service(lab.aws_region)
@@ -825,11 +854,14 @@ async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> No
             await AwsEc2Service(lab.aws_region).delete_available_lab_volumes(lab_id=lab.id)
         except Exception as exc:
             errors.append(f"volumes: {exc}")
-    await _delete_lab_password_secret(lab, critical_errors)
+    credential_errors: list[str] = []
+    await _delete_lab_password_secret(lab, credential_errors)
+    critical_errors.extend(credential_errors)
     errors.extend(error for error in critical_errors if error not in errors)
 
-    lab.status = LabStatus.failed if critical_errors else LabStatus.terminated
-    lab.terminated_at = utcnow()
+    lab.status = LabStatus.terminating if critical_errors else LabStatus.terminated
+    if not critical_errors:
+        lab.terminated_at = utcnow()
     job.status = "failed" if critical_errors else "finished"
     job.finished_at = utcnow()
     job.message = "; ".join(errors) if errors else "Cleanup completed"
@@ -841,6 +873,25 @@ async def retry_terminating_labs(db: AsyncSession) -> int:
     rows = (await db.scalars(select(Lab).where(Lab.status == LabStatus.terminating))).all()
     for lab in rows:
         await terminate_lab(db, lab, CleanupReason.force)
+    return len(rows)
+
+
+async def cleanup_terminal_lab_artifacts(db: AsyncSession) -> int:
+    rows = (
+        await db.scalars(
+            select(Lab).where(
+                Lab.status.in_([LabStatus.terminated, LabStatus.expired, LabStatus.interrupted]),
+                or_(
+                    Lab.guacamole_connection_id.is_not(None),
+                    Lab.access_url.is_not(None),
+                    Lab.password_secret_ref.notin_(["", "deleted"]),
+                    Lab.password_ciphertext != "",
+                ),
+            )
+        )
+    ).all()
+    for lab in rows:
+        await terminate_lab(db, lab, CleanupReason.orphan)
     return len(rows)
 
 

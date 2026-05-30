@@ -174,6 +174,41 @@ class GuacamoleService:
                     response.raise_for_status()
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
+    async def delete_connections_by_name_prefix(self, name_prefix: str) -> list[str]:
+        token = await self._token()
+        async with _GUACAMOLE_WRITE_SEMAPHORE:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections",
+                    params={"token": token},
+                )
+                response.raise_for_status()
+                connections = response.json()
+                if isinstance(connections, dict):
+                    values = connections.values()
+                elif isinstance(connections, list):
+                    values = connections
+                else:
+                    values = []
+
+                deleted: list[str] = []
+                for connection in values:
+                    if not isinstance(connection, dict):
+                        continue
+                    name = str(connection.get("name") or "")
+                    connection_id = connection.get("identifier")
+                    if not connection_id or not name.startswith(name_prefix):
+                        continue
+                    delete_response = await client.delete(
+                        f"{self.settings.guacamole_base_url}/api/session/data/{self.settings.guacamole_datasource}/connections/{connection_id}",
+                        params={"token": token},
+                    )
+                    if delete_response.status_code != 404:
+                        delete_response.raise_for_status()
+                    deleted.append(str(connection_id))
+        return deleted
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
     async def delete_user(self, username: str) -> None:
         token = await self._token()
         encoded_username = quote(username, safe="")
