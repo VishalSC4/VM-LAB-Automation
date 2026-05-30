@@ -286,6 +286,15 @@ def _schedule_state(lab: Lab, now: datetime) -> str:
     return "active"
 
 
+def _started_before_current_schedule_day(lab: Lab, now: datetime) -> bool:
+    if not lab.last_started_at:
+        return True
+    local_tz = ZoneInfo(lab.schedule_timezone or "Asia/Kolkata")
+    local_now = now.astimezone(local_tz)
+    local_started_at = _aware(lab.last_started_at).astimezone(local_tz)
+    return local_started_at.date() < local_now.date()
+
+
 def _pause_provisioning_until_schedule(db: AsyncSession, lab: Lab, state: str) -> None:
     lab.status = LabStatus.scheduled
     db.add(
@@ -971,7 +980,7 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
         lab.last_started_at = lab.last_seen_at
         db.add(AuditLog(actor="system", action="lab.resume.finished", resource_id=lab.id, message="Lab is running again"))
     except Exception as exc:
-        if _is_spot_lab(lab) and "IncorrectSpotRequestState" in str(exc):
+        if _is_spot_lab(lab) and ("IncorrectSpotRequestState" in str(exc) or "already terminated" in str(exc)):
             db.add(
                 AuditLog(
                     actor="system",
@@ -1186,7 +1195,7 @@ async def enforce_scheduled_labs(db: AsyncSession) -> None:
                 lab.status = LabStatus.provisioning
                 db.add(AuditLog(actor="system", action="lab.schedule.launch", resource_id=lab.id, message="Scheduled lab window started"))
                 provision_ids.append(lab.id)
-            elif lab.status == LabStatus.stopped and lab.ec2_instance_id:
+            elif lab.status == LabStatus.stopped and lab.ec2_instance_id and _started_before_current_schedule_day(lab, now):
                 db.add(AuditLog(actor="system", action="lab.schedule.resume", resource_id=lab.id, message="Scheduled lab window started"))
                 resume_ids.append(lab.id)
         elif state == "after_day":
