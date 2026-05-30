@@ -27,10 +27,49 @@ def _schedule_provision_lab(lab_id: str, position: int = 0) -> None:
     asyncio.create_task(_provision_lab_after_delay(lab_id, delay_seconds))
 
 
+def _schedule_stop_lab(lab_id: str, reason: CleanupReason) -> None:
+    asyncio.create_task(_stop_lab_by_id(lab_id, reason))
+
+
+def _schedule_resume_lab(lab_id: str) -> None:
+    asyncio.create_task(_resume_lab_by_id(lab_id))
+
+
+def _schedule_terminate_lab(lab_id: str, reason: CleanupReason) -> None:
+    asyncio.create_task(_terminate_lab_by_id(lab_id, reason))
+
+
 async def _provision_lab_after_delay(lab_id: str, delay_seconds: int) -> None:
     if delay_seconds > 0:
         await asyncio.sleep(delay_seconds)
     await provision_lab(lab_id)
+
+
+async def _stop_lab_by_id(lab_id: str, reason: CleanupReason) -> None:
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as db:
+        lab = await db.get(Lab, lab_id)
+        if lab:
+            await stop_lab(db, lab, reason)
+
+
+async def _resume_lab_by_id(lab_id: str) -> None:
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as db:
+        lab = await db.get(Lab, lab_id)
+        if lab:
+            await resume_lab(db, lab)
+
+
+async def _terminate_lab_by_id(lab_id: str, reason: CleanupReason) -> None:
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as db:
+        lab = await db.get(Lab, lab_id)
+        if lab:
+            await terminate_lab(db, lab, reason)
 
 
 def utcnow() -> datetime:
@@ -1059,28 +1098,45 @@ async def enforce_scheduled_labs(db: AsyncSession) -> None:
         )
     ).all()
 
+    provision_ids: list[str] = []
+    resume_ids: list[str] = []
+    stop_ids: list[str] = []
+    terminate_ids: list[str] = []
+
     for lab in rows:
         state = _schedule_state(lab, now)
         if state == "active":
             if lab.status == LabStatus.scheduled and not lab.ec2_instance_id:
                 lab.status = LabStatus.provisioning
                 db.add(AuditLog(actor="system", action="lab.schedule.launch", resource_id=lab.id, message="Scheduled lab window started"))
-                await db.commit()
-                _schedule_provision_lab(lab.id)
+                provision_ids.append(lab.id)
             elif lab.status == LabStatus.stopped and lab.ec2_instance_id:
                 db.add(AuditLog(actor="system", action="lab.schedule.resume", resource_id=lab.id, message="Scheduled lab window started"))
-                await db.commit()
-                await resume_lab(db, lab)
+                resume_ids.append(lab.id)
         elif state == "after_day":
             if lab.status == LabStatus.running:
                 db.add(AuditLog(actor="system", action="lab.schedule.stop", resource_id=lab.id, message="Scheduled lab window ended for today"))
-                await db.commit()
-                await stop_lab(db, lab, CleanupReason.force)
+                stop_ids.append(lab.id)
             elif lab.status == LabStatus.scheduled:
                 lab.status = LabStatus.scheduled
-                await db.commit()
         elif state == "after":
-            await terminate_lab(db, lab, CleanupReason.expiry)
+            if lab.status != LabStatus.terminating:
+                if lab.status == LabStatus.running:
+                    _accrue_running_time(lab, now)
+                lab.status = LabStatus.terminating
+                db.add(AuditLog(actor="system", action="lab.schedule.expire", resource_id=lab.id, message="Scheduled lab window ended; queued for termination"))
+                terminate_ids.append(lab.id)
+
+    await db.commit()
+
+    for lab_id in provision_ids:
+        _schedule_provision_lab(lab_id)
+    for lab_id in resume_ids:
+        _schedule_resume_lab(lab_id)
+    for lab_id in stop_ids:
+        _schedule_stop_lab(lab_id, CleanupReason.force)
+    for lab_id in terminate_ids:
+        _schedule_terminate_lab(lab_id, CleanupReason.expiry)
 
 
 async def dashboard(db: AsyncSession) -> dict[str, int]:
