@@ -1114,10 +1114,10 @@ async def enforce_scheduled_labs(db: AsyncSession) -> None:
                 db.add(AuditLog(actor="system", action="lab.schedule.resume", resource_id=lab.id, message="Scheduled lab window started"))
                 resume_ids.append(lab.id)
         elif state == "after_day":
-            if lab.status == LabStatus.running:
+            if lab.status in {LabStatus.running, LabStatus.provisioning, LabStatus.resuming} and lab.ec2_instance_id:
                 db.add(AuditLog(actor="system", action="lab.schedule.stop", resource_id=lab.id, message="Scheduled lab window ended for today"))
                 stop_ids.append(lab.id)
-            elif lab.status == LabStatus.scheduled:
+            elif lab.status in {LabStatus.scheduled, LabStatus.provisioning, LabStatus.resuming}:
                 lab.status = LabStatus.scheduled
         elif state == "after":
             if lab.status != LabStatus.terminating:
