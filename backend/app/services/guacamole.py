@@ -1,13 +1,19 @@
 import asyncio
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from urllib.parse import quote
 
 from app.core.config import get_settings
 
 
 _GUACAMOLE_WRITE_SEMAPHORE = asyncio.Semaphore(5)
+
+
+class GuacamoleConnectionNotFound(RuntimeError):
+    def __init__(self, connection_id: str):
+        super().__init__(f"Guacamole connection {connection_id} does not exist")
+        self.connection_id = connection_id
 
 
 class GuacamoleService:
@@ -68,7 +74,11 @@ class GuacamoleService:
                 connection_id = str(response.json()["identifier"])
         return connection_id, self.access_url_for_connection(connection_id)
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=20))
+    @retry(
+        retry=retry_if_not_exception_type(GuacamoleConnectionNotFound),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=20),
+    )
     async def update_rdp_connection(
         self,
         connection_id: str,
@@ -83,6 +93,8 @@ class GuacamoleService:
         async with _GUACAMOLE_WRITE_SEMAPHORE:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(url, params={"token": token})
+                if response.status_code == 404:
+                    raise GuacamoleConnectionNotFound(connection_id)
                 response.raise_for_status()
                 current = response.json()
 

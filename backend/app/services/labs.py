@@ -14,7 +14,7 @@ from app.core.security import generate_windows_password
 from app.models.models import AuditLog, Batch, CleanupJob, CleanupReason, Lab, LabStatus, uuid_str
 from app.schemas.schemas import BatchCreate
 from app.services.aws_ec2 import AwsEc2Service
-from app.services.guacamole import GuacamoleService
+from app.services.guacamole import GuacamoleConnectionNotFound, GuacamoleService
 from app.services.pricing import fallback_windows_price, get_estimated_spot_windows_price, get_hourly_windows_price
 from app.services.secrets import delete_lab_credential_artifacts, get_lab_password, store_lab_password
 
@@ -377,18 +377,39 @@ async def _reachable_rdp_host(lab: Lab, *, attempts: int = 30, delay_seconds: in
     raise RuntimeError(f"RDP port 3389 is not reachable on {', '.join(candidates)}")
 
 
-async def _sync_guacamole_rdp_target(lab: Lab, windows_hostname: str | None = None) -> None:
+async def _clear_missing_guacamole_connection(db: AsyncSession, lab: Lab, missing_connection_id: str) -> None:
+    lab.guacamole_connection_id = None
+    lab.access_url = None
+    db.add(
+        AuditLog(
+            actor="system",
+            action="lab.guacamole.missing",
+            resource_id=lab.id,
+            message=f"Saved Guacamole connection {missing_connection_id} was missing; recreating browser access",
+        )
+    )
+    await db.commit()
+
+
+async def _sync_guacamole_rdp_target(db: AsyncSession, lab: Lab, windows_hostname: str | None = None) -> None:
     if not lab.guacamole_connection_id:
         return
     hostname = await _reachable_rdp_host(lab, attempts=30, delay_seconds=10)
     password = await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
-    await GuacamoleService().update_rdp_connection(
-        lab.guacamole_connection_id,
-        hostname=hostname,
-        username=_rdp_username(lab),
-        password=password,
-        domain=windows_hostname or ".",
-    )
+    guacamole = GuacamoleService()
+    try:
+        await guacamole.update_rdp_connection(
+            lab.guacamole_connection_id,
+            hostname=hostname,
+            username=_rdp_username(lab),
+            password=password,
+            domain=windows_hostname or ".",
+        )
+        lab.access_url = guacamole.access_url_for_connection(lab.guacamole_connection_id)
+        await db.commit()
+    except GuacamoleConnectionNotFound as exc:
+        await _clear_missing_guacamole_connection(db, lab, exc.connection_id)
+        await _ensure_guacamole_access(db, lab, password, windows_hostname, rdp_host=hostname)
 
 
 async def _stable_rdp_host(lab: Lab) -> str:
@@ -414,15 +435,19 @@ async def _ensure_guacamole_access(
     await db.commit()
 
     if lab.guacamole_connection_id:
-        await guacamole.update_rdp_connection(
-            lab.guacamole_connection_id,
-            hostname=guac_host,
-            username=_rdp_username(lab),
-            password=raw_password,
-            domain=windows_hostname or ".",
-        )
-        lab.access_url = lab.access_url or guacamole.access_url_for_connection(lab.guacamole_connection_id)
-    else:
+        try:
+            await guacamole.update_rdp_connection(
+                lab.guacamole_connection_id,
+                hostname=guac_host,
+                username=_rdp_username(lab),
+                password=raw_password,
+                domain=windows_hostname or ".",
+            )
+            lab.access_url = guacamole.access_url_for_connection(lab.guacamole_connection_id)
+        except GuacamoleConnectionNotFound as exc:
+            await _clear_missing_guacamole_connection(db, lab, exc.connection_id)
+
+    if not lab.guacamole_connection_id:
         instance_suffix = f"-{lab.ec2_instance_id[-6:]}" if lab.ec2_instance_id else ""
         connection_id, access_url = await guacamole.create_rdp_connection(
             name=f"{lab.owner_label}-{lab.id[:8]}{instance_suffix}",
@@ -862,7 +887,7 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
                 instance = await AwsEc2Service(lab.aws_region).start_instance(lab.ec2_instance_id, lab_id=lab.id)
                 lab.private_ip = instance.private_ip
                 lab.public_ip = instance.public_ip
-                await _sync_guacamole_rdp_target(lab, instance.windows_hostname)
+                await _sync_guacamole_rdp_target(db, lab, instance.windows_hostname)
                 lab.last_started_at = lab.last_started_at or utcnow()
             except Exception as exc:
                 db.add(AuditLog(actor="system", action="lab.resume.failed", resource_id=lab.id, message=str(exc)))
@@ -889,7 +914,7 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
         instance = await AwsEc2Service(lab.aws_region).start_instance(lab.ec2_instance_id, lab_id=lab.id)
         lab.private_ip = instance.private_ip
         lab.public_ip = instance.public_ip
-        await _sync_guacamole_rdp_target(lab, instance.windows_hostname)
+        await _sync_guacamole_rdp_target(db, lab, instance.windows_hostname)
         lab.status = LabStatus.running
         lab.last_seen_at = utcnow()
         lab.last_started_at = lab.last_seen_at
@@ -1013,7 +1038,7 @@ async def prepare_lab_session(db: AsyncSession, lab: Lab) -> None:
         if lab.status != LabStatus.running:
             raise RuntimeError("Lab could not be started")
     elif state == "running":
-        await _sync_guacamole_rdp_target(lab)
+        await _sync_guacamole_rdp_target(db, lab)
 
 
 async def touch_lab_access(db: AsyncSession, connection_id: str) -> None:

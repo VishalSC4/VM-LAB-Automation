@@ -28,13 +28,15 @@ async def session_redirect(
     db: AsyncSession = Depends(get_db),
 ) -> RedirectResponse:
     lab = await db.scalar(select(Lab).where(Lab.guacamole_connection_id == connection_id))
+    redirect_connection_id = connection_id
     if lab:
         try:
             await prepare_lab_session(db, lab)
+            redirect_connection_id = lab.guacamole_connection_id or connection_id
         except RuntimeError as exc:
             raise HTTPException(status_code=410, detail=str(exc)) from exc
     datasource = get_settings().guacamole_datasource
-    raw_identifier = f"{connection_id}\x00c\x00{datasource}".encode()
+    raw_identifier = f"{redirect_connection_id}\x00c\x00{datasource}".encode()
     encoded = base64.urlsafe_b64encode(raw_identifier).decode().rstrip("=")
     return RedirectResponse(url=f"/guacamole/#/client/{encoded}")
 
