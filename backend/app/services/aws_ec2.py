@@ -79,6 +79,10 @@ Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Continue
 Restart-Service TermService -Force -ErrorAction Continue
 Set-Service -Name WSearch -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service -Name WSearch -ErrorAction SilentlyContinue
+Set-Service -Name StateRepository -StartupType Automatic -ErrorAction SilentlyContinue
+Start-Service -Name StateRepository -ErrorAction SilentlyContinue
+Start-Service -Name AppXSvc -ErrorAction SilentlyContinue
+Start-Service -Name Themes -ErrorAction SilentlyContinue
 powercfg /hibernate off
 powercfg /setactive SCHEME_MAX
 powercfg /change monitor-timeout-ac 0
@@ -86,6 +90,123 @@ powercfg /change standby-timeout-ac 0
 Set-TimeZone -Id 'India Standard Time' -ErrorAction SilentlyContinue
 Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
 Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name LongPathsEnabled -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name EnableLUA -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name FilterAdministratorToken -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name ConsentPromptBehaviorAdmin -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name PromptOnSecureDesktop -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Active Setup\\Installed Components\\{{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}}' -Name IsInstalled -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Active Setup\\Installed Components\\{{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}}' -Name IsInstalled -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+New-Item -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search' -Force | Out-Null
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search' -Name AllowCortana -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search' -Name DisableWebSearch -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search' -Name ConnectedSearchUseWeb -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search' -Name ConnectedSearchUseWebOverMeteredConnections -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+
+function Repair-StartAndSearch {{
+    $ControlPath = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control'
+    try {{
+        $Acl = Get-Acl $ControlPath
+        $Acl.SetAccessRuleProtection($false, $true)
+        $Rule = New-Object System.Security.AccessControl.RegistryAccessRule(
+            'ALL APPLICATION PACKAGES',
+            'ReadKey',
+            'ContainerInherit,ObjectInherit',
+            'None',
+            'Allow'
+        )
+        $Acl.SetAccessRule($Rule)
+        Set-Acl -Path $ControlPath -AclObject $Acl
+    }} catch {{ }}
+    New-Item -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Force | Out-Null
+    Set-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Name BingSearchEnabled -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Name CortanaConsent -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Name AllowSearchToUseLocation -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Name ImmersiveSearch -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search' -Name SearchboxTaskbarMode -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    Get-Process -Name SearchHost,SearchIndexer,StartMenuExperienceHost,ShellExperienceHost,explorer -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-Service -Name WSearch -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $PackageNames = @(
+        'Microsoft.Windows.StartMenuExperienceHost',
+        'Microsoft.Windows.ShellExperienceHost',
+        'Microsoft.Windows.Search',
+        'MicrosoftWindows.Client.CBS'
+    )
+    foreach ($PackageName in $PackageNames) {{
+        Get-Process -Name SearchHost,StartMenuExperienceHost,ShellExperienceHost -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-AppxPackage -AllUsers -Name $PackageName -ErrorAction SilentlyContinue | ForEach-Object {{
+            $Manifest = Join-Path $_.InstallLocation 'AppxManifest.xml'
+            if (Test-Path $Manifest) {{
+                Add-AppxPackage -DisableDevelopmentMode -Register $Manifest -ErrorAction SilentlyContinue
+            }}
+        }}
+    }}
+    $SearchData = 'C:\\ProgramData\\Microsoft\\Search\\Data\\Applications\\Windows'
+    if (Test-Path $SearchData) {{
+        icacls $SearchData /grant 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Null
+    }}
+    Get-ChildItem -Path "$env:LOCALAPPDATA\\Packages" -Directory -Filter 'Microsoft.Windows.Search*' -ErrorAction SilentlyContinue |
+        ForEach-Object {{
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $_.FullName 'LocalState')
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $_.FullName 'TempState')
+        }}
+    Start-Service -Name StateRepository -ErrorAction SilentlyContinue
+    Start-Service -Name AppXSvc -ErrorAction SilentlyContinue
+    Start-Service -Name WSearch -ErrorAction SilentlyContinue
+    $TdlRecover = Join-Path $env:SystemRoot 'System32\\tdlrecover.exe'
+    if (Test-Path $TdlRecover) {{
+        & $TdlRecover -reregister -resetlayout -resetcache
+    }}
+    Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\ctfmon.exe') -ErrorAction SilentlyContinue
+    Start-Process explorer.exe -ErrorAction SilentlyContinue
+}}
+Repair-StartAndSearch
+
+function Ensure-OpenShellMenu {{
+    $OpenShell = @(
+        'C:\\Program Files\\Open-Shell\\StartMenu.exe',
+        'C:\\Program Files\\Open-Shell\\ClassicStartMenu.exe',
+        'C:\\Program Files\\Open-Shell\\OpenShellMenu.exe'
+    ) | Where-Object {{ Test-Path $_ }} | Select-Object -First 1
+    if (-not $OpenShell -and (Get-Command choco.exe -ErrorAction SilentlyContinue)) {{
+        choco install open-shell -y --no-progress --limit-output
+        $OpenShell = @(
+            'C:\\Program Files\\Open-Shell\\StartMenu.exe',
+            'C:\\Program Files\\Open-Shell\\ClassicStartMenu.exe',
+            'C:\\Program Files\\Open-Shell\\OpenShellMenu.exe'
+        ) | Where-Object {{ Test-Path $_ }} | Select-Object -First 1
+    }}
+    if ($OpenShell) {{
+        $StartupDir = 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup'
+        New-Item -ItemType Directory -Force -Path $StartupDir | Out-Null
+        $Shell = New-Object -ComObject WScript.Shell
+        $Shortcut = $Shell.CreateShortcut((Join-Path $StartupDir 'Open-Shell Menu.lnk'))
+        $Shortcut.TargetPath = $OpenShell
+        $Shortcut.Save()
+        Start-Process -FilePath $OpenShell -ErrorAction SilentlyContinue
+    }}
+}}
+Ensure-OpenShellMenu
+
+$CloudLabDir = 'C:\\ProgramData\\CloudLab'
+New-Item -ItemType Directory -Force -Path $CloudLabDir | Out-Null
+$StartSearchRepairScript = Join-Path $CloudLabDir 'Repair-StartSearch.ps1'
+(
+    '$ErrorActionPreference = ''Continue''',
+    "Start-Transcript -Path 'C:\\ProgramData\\CloudLab\\StartSearchRepair.log' -Append",
+    ${{function:Repair-StartAndSearch}}.ToString(),
+    "Stop-Transcript"
+) -join [Environment]::NewLine | Set-Content -Path $StartSearchRepairScript -Encoding UTF8
+$StartSearchTask = 'CloudLabRepairStartSearch'
+$StartSearchTaskTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
+schtasks /Delete /TN $StartSearchTask /F 2>$null | Out-Null
+schtasks /Create /TN $StartSearchTask /SC ONCE /ST $StartSearchTaskTime /RU $AdminUsername /RP $PlainPassword /RL HIGHEST /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$StartSearchRepairScript`"" /F | Out-Null
+schtasks /Run /TN $StartSearchTask | Out-Null
+$StartSearchLogonTask = 'CloudLabRepairStartSearchOnLogon'
+schtasks /Delete /TN $StartSearchLogonTask /F 2>$null | Out-Null
+schtasks /Create /TN $StartSearchLogonTask /SC ONLOGON /RU $AdminUsername /RL HIGHEST /IT /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$StartSearchRepairScript`"" /F | Out-Null
 
 $LabRoot = 'C:\\LabFiles'
 $PublicDesktop = 'C:\\Users\\Public\\Desktop'
