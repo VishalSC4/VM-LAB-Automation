@@ -221,6 +221,18 @@ def _is_spot_lab(lab: Lab) -> bool:
     return (lab.instance_market or "").lower() == "spot"
 
 
+async def _was_terminated_by_expiry(db: AsyncSession, lab: Lab) -> bool:
+    marker = await db.scalar(
+        select(AuditLog.id)
+        .where(
+            AuditLog.resource_id == lab.id,
+            AuditLog.action.in_(["lab.cleanup.expiry", "lab.schedule.expire"]),
+        )
+        .limit(1)
+    )
+    return marker is not None
+
+
 def _accrue_running_time(lab: Lab, now: datetime) -> None:
     if lab.last_started_at:
         lab.accumulated_runtime_seconds = _runtime_seconds(lab, now)
@@ -1249,7 +1261,12 @@ async def dashboard(db: AsyncSession) -> dict[str, int]:
 
 
 async def extend_lab(db: AsyncSession, lab: Lab, hours: float, admin_id: str) -> None:
-    if lab.status in {LabStatus.terminated, LabStatus.terminating}:
+    relaunch_after_expiry = False
+    if lab.status == LabStatus.terminated:
+        if not await _was_terminated_by_expiry(db, lab):
+            raise RuntimeError(f"Lab cannot be extended in status {lab.status.value}")
+        relaunch_after_expiry = True
+    elif lab.status == LabStatus.terminating:
         raise RuntimeError(f"Lab cannot be extended in status {lab.status.value}")
 
     now = utcnow()
@@ -1265,6 +1282,19 @@ async def extend_lab(db: AsyncSession, lab: Lab, hours: float, admin_id: str) ->
             lab.schedule_end_time = local_expiry.strftime("%H:%M")
     if lab.status == LabStatus.expired and lab.ec2_instance_id:
         lab.status = LabStatus.stopped
+    if relaunch_after_expiry:
+        lab.status = LabStatus.provisioning
+        lab.ec2_instance_id = None
+        lab.private_ip = None
+        lab.public_ip = None
+        lab.guacamole_connection_id = None
+        lab.access_url = None
+        lab.password_secret_ref = "pending"
+        lab.password_ciphertext = generate_windows_password()
+        lab.terminated_at = None
+        lab.interrupted_at = None
+        lab.last_seen_at = None
+        lab.last_started_at = None
     if lab.status == LabStatus.running:
         lab.last_seen_at = now
     db.add(
@@ -1281,6 +1311,17 @@ async def extend_lab(db: AsyncSession, lab: Lab, hours: float, admin_id: str) ->
     await db.commit()
 
     if not lab.ec2_instance_id:
+        if relaunch_after_expiry:
+            db.add(
+                AuditLog(
+                    actor="system",
+                    action="lab.extend.relaunch",
+                    resource_id=lab.id,
+                    message="Expiry-terminated lab was extended; launching a replacement instance",
+                )
+            )
+            await db.commit()
+            _schedule_provision_lab(lab.id)
         return
 
     try:
@@ -1292,6 +1333,9 @@ async def extend_lab(db: AsyncSession, lab: Lab, hours: float, admin_id: str) ->
     except Exception as exc:
         db.add(AuditLog(actor="system", action="lab.extend.tag_failed", resource_id=lab.id, message=str(exc)))
         await db.commit()
+
+    if lab.status == LabStatus.stopped:
+        _schedule_resume_lab(lab.id)
 
 
 async def add_lab_budget_credit(db: AsyncSession, lab: Lab, amount: float, admin_id: str) -> None:

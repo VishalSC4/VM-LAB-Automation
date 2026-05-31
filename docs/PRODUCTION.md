@@ -2,7 +2,7 @@
 
 ## Architecture
 
-One EC2 host runs Docker Compose for the admin UI, FastAPI API, NGINX, PostgreSQL, Guacamole, guacd, and Guacamole PostgreSQL. Each lab user receives one isolated Windows EC2 instance launched from a golden AMI. RDP is only allowed from the Guacamole host security group.
+One EC2 host runs Docker Compose for the admin UI, FastAPI API, NGINX, PostgreSQL, Guacamole, guacd, and Guacamole PostgreSQL. Current production host IP: `3.6.143.195`. Each lab user receives one isolated Windows EC2 instance launched from a golden AMI. RDP is only allowed from the Guacamole host security group.
 
 ## AWS Checklist
 
