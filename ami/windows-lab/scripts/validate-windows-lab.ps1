@@ -1,5 +1,6 @@
 param(
-    [string]$LabRoot = "C:\LabFiles"
+    [string]$LabRoot = "C:\LabFiles",
+    [switch]$IncludePowerBI
 )
 
 $ErrorActionPreference = "Continue"
@@ -75,6 +76,29 @@ Test-Command "Vite" "vite --version"
 Test-Command "Create React App" "create-react-app --version"
 Test-Command "MongoDB shell" "mongosh --version"
 
+if ($IncludePowerBI) {
+    Test-PathExists "Power BI Desktop executable" @(
+        "C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"
+    )
+    Test-PathExists "Power BI Desktop model engine" @(
+        "C:\Program Files\Microsoft Power BI Desktop\bin\msmdsrv.exe"
+    )
+    Test-PathExists "Microsoft Edge WebView2 runtime" @(
+        "C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+        "C:\Program Files\Microsoft\EdgeWebView\Application"
+    )
+    $powerBiHome = [Environment]::GetEnvironmentVariable("POWERBI_DESKTOP_HOME", "Machine")
+    Add-Check "POWERBI_DESKTOP_HOME environment variable" ($powerBiHome -eq "C:\Program Files\Microsoft Power BI Desktop") $powerBiHome
+    Add-Check "Power BI bin in machine PATH" ($machinePath -like "*C:\Program Files\Microsoft Power BI Desktop\bin*") "machine PATH"
+    try {
+        $powerBiExe = "C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"
+        $version = (Get-Item $powerBiExe).VersionInfo.ProductVersion
+        Add-Check "Power BI Desktop version readable" ([bool]$version) $version
+    } catch {
+        Add-Check "Power BI Desktop version readable" $false $_.Exception.Message
+    }
+}
+
 try {
     $service = Get-Service MongoDB -ErrorAction Stop
     if ($service.Status -ne "Running") {
@@ -135,8 +159,9 @@ $desktop = "C:\Users\Public\Desktop"
     "React Developer Terminal.lnk",
     "MongoDB Shell.lnk",
     "MongoDB Service Status.lnk",
+    $(if ($IncludePowerBI) { "Power BI Desktop.lnk" }),
     "Lab Files.lnk"
-) | ForEach-Object {
+) | Where-Object { $_ } | ForEach-Object {
     Add-Check "Desktop shortcut $_" (Test-Path (Join-Path $desktop $_)) $_
 }
 

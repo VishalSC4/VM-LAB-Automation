@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     claude_require_fast_launch: bool = True
     claude_fast_launch_min_target_count: int = Field(default=6, ge=1, le=100)
     lab_provision_stagger_seconds: int = Field(default=15, ge=0, le=120)
+    lab_provisioning_concurrency: int = Field(default=10, ge=1, le=40)
 
     guacamole_base_url: str = "http://guacamole:8080/guacamole"
     guacamole_public_url: str = ""

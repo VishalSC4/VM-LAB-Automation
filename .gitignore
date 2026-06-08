@@ -48,5 +48,6 @@ override.tf.json
 .DS_Store
 Thumbs.db
 NUL
+_UL
 .vscode/
 .idea/

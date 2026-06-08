@@ -40,12 +40,12 @@ LAB_SPOT_FALLBACK_TO_ON_DEMAND=true
 LAB_SPOT_INSTANCE_TYPES=t3a.xlarge,t3.xlarge,c6a.xlarge,c5a.xlarge,c5.xlarge,c6i.xlarge,c7i.xlarge
 LAB_SPOT_MAX_PRICE=
 LAB_ROOT_VOLUME_SIZE_GB=100
-LAB_PROVISION_STAGGER_SECONDS=0
+LAB_PROVISION_STAGGER_SECONDS=2
 ```
 
 Use lab subnets in at least two Availability Zones. Spot and On-Demand capacity errors are often scoped to a single AZ, and the backend retries each configured subnet before falling back.
 
-Keep `LAB_PROVISION_STAGGER_SECONDS=0` when all learners need labs ready together. Increase it only if AWS request-rate throttling appears during very large batches.
+Keep `LAB_PROVISION_STAGGER_SECONDS=2` for large classroom launches so AWS does not throttle a burst of Spot and fallback `RunInstances` calls. Increase it further if AWS still returns request-rate throttling.
 
 Spot labs use persistent Spot requests with interruption behavior set to `stop`, so budget exhaustion can stop the VM and budget credit can start it again when Spot capacity is available. Expiry cleanup cancels the persistent Spot request before terminating the VM so AWS does not relaunch a replacement.
 

@@ -1,6 +1,7 @@
 param(
     [string]$LabRoot = "C:\LabFiles",
     [string]$TimeZone = "India Standard Time",
+    [switch]$IncludePowerBI,
     [switch]$SkipSysprep
 )
 
@@ -49,6 +50,25 @@ function New-LabShortcut {
     $shortcut.Arguments = $Arguments
     if ($WorkingDirectory) { $shortcut.WorkingDirectory = $WorkingDirectory }
     $shortcut.Save()
+}
+
+function Download-File {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [int]$TimeoutSeconds = 900
+    )
+    Remove-Item -Force -ErrorAction SilentlyContinue $OutFile
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if (Test-Path $curl) {
+        & $curl -L --fail --silent --show-error --connect-timeout 20 --max-time $TimeoutSeconds -o $OutFile $Uri
+        if ($LASTEXITCODE -ne 0) { throw "curl.exe failed for $Uri with exit code $LASTEXITCODE" }
+    } else {
+        Invoke-WebRequest -UseBasicParsing -Uri $Uri -MaximumRedirection 10 -OutFile $OutFile -TimeoutSec $TimeoutSeconds
+    }
+    if (-not (Test-Path $OutFile) -or ((Get-Item $OutFile).Length -lt 1MB)) {
+        throw "Download did not produce a usable file: $OutFile"
+    }
 }
 
 Step "Windows performance and RDP defaults" {
@@ -128,6 +148,63 @@ Step "Configure machine PATH and developer defaults" {
     npm install --global create-react-app vite yarn
 }
 
+if ($IncludePowerBI) {
+    Step "Install and configure Microsoft Power BI Desktop" {
+        $powerBiUrl = $env:POWERBI_DOWNLOAD_URL
+        if (-not $powerBiUrl) {
+            $powerBiUrl = "https://download.microsoft.com/download/8/8/0/880BCA75-79DD-466A-927D-1ABF1F5454B0/PBIDesktopSetup_x64.exe"
+        }
+        $webView2Url = $env:WEBVIEW2_DOWNLOAD_URL
+        if (-not $webView2Url) {
+            $webView2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+        }
+
+        $installDir = "C:\Program Files\Microsoft Power BI Desktop"
+        $powerBiInstaller = Join-Path $LogDir "PBIDesktopSetup_x64.exe"
+        $webView2Installer = Join-Path $LogDir "MicrosoftEdgeWebView2Setup.exe"
+        Download-File -Uri $webView2Url -OutFile $webView2Installer -TimeoutSeconds 300
+        $webView2Process = Start-Process -FilePath $webView2Installer -ArgumentList "/silent", "/install" -Wait -PassThru
+        if ($webView2Process.ExitCode -notin 0, 1638) {
+            throw "WebView2 installer failed with exit code $($webView2Process.ExitCode)"
+        }
+
+        Download-File -Uri $powerBiUrl -OutFile $powerBiInstaller -TimeoutSeconds 1800
+        $powerBiArgs = @(
+            "-quiet",
+            "-norestart",
+            "-log", "`"$LogDir\powerbi-install.log`"",
+            "ACCEPT_EULA=1",
+            "INSTALLDESKTOPSHORTCUT=1",
+            "DISABLE_UPDATE_NOTIFICATION=1",
+            "INSTALLLOCATION=`"$installDir`""
+        )
+        $powerBiProcess = Start-Process -FilePath $powerBiInstaller -ArgumentList $powerBiArgs -Wait -PassThru
+        if ($powerBiProcess.ExitCode -notin 0, 3010) {
+            throw "Power BI Desktop installer failed with exit code $($powerBiProcess.ExitCode)"
+        }
+
+        $powerBiExe = Join-Path $installDir "bin\PBIDesktop.exe"
+        if (-not (Test-Path $powerBiExe)) { throw "PBIDesktop.exe was not found at $powerBiExe" }
+
+        [Environment]::SetEnvironmentVariable("POWERBI_DESKTOP_HOME", $installDir, "Machine")
+        Add-MachinePath (Join-Path $installDir "bin")
+
+        New-Item -Path "HKLM:\SOFTWARE\Microsoft\Microsoft Power BI Desktop" -Force | Out-Null
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Microsoft Power BI Desktop" -Name DisableUpdateNotification -Value 1 -Type DWord -Force
+
+        New-Item -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" -Force | Out-Null
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" -Name IsInstalled -Value 0 -Type DWord -Force
+        New-Item -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}" -Force | Out-Null
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}" -Name IsInstalled -Value 0 -Type DWord -Force
+
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut("C:\Users\Public\Desktop\Power BI Desktop.lnk")
+        $shortcut.TargetPath = $powerBiExe
+        $shortcut.WorkingDirectory = Split-Path $powerBiExe
+        $shortcut.Save()
+    }
+}
+
 Step "Configure MongoDB service" {
     $mongoCfg = Join-Path $LogDir "mongod.cfg"
     @"
@@ -202,6 +279,10 @@ Step "Create public desktop shortcuts" {
     New-LabShortcut "React Developer Terminal.lnk" $powershell "-NoProfile -NoExit -Command `"vite --version; cd '$LabRoot\React'`"" "$LabRoot\React"
     New-LabShortcut "MongoDB Shell.lnk" $powershell "-NoProfile -NoExit -Command `"Start-Service MongoDB -ErrorAction SilentlyContinue; mongosh`"" "$LabRoot\MongoDB"
     New-LabShortcut "MongoDB Service Status.lnk" $powershell "-NoProfile -NoExit -Command `"Get-Service MongoDB; mongosh --quiet --eval 'db.runCommand({ ping: 1 })'`"" "$LabRoot\MongoDB"
+    if ($IncludePowerBI) {
+        $powerBi = "C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"
+        New-LabShortcut "Power BI Desktop.lnk" $powerBi
+    }
 
     $shell = New-Object -ComObject WScript.Shell
     $folderShortcut = $shell.CreateShortcut((Join-Path $desktop "Lab Files.lnk"))
@@ -210,7 +291,10 @@ Step "Create public desktop shortcuts" {
 }
 
 Step "Run validation" {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\UNext\validate-windows-lab.ps1" -LabRoot $LabRoot
+    $validationArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\ProgramData\UNext\validate-windows-lab.ps1", "-LabRoot", $LabRoot)
+    if ($IncludePowerBI) { $validationArgs += "-IncludePowerBI" }
+    $validation = Start-Process -FilePath "powershell.exe" -ArgumentList $validationArgs -Wait -PassThru
+    if ($validation.ExitCode -ne 0) { throw "Validation failed with exit code $($validation.ExitCode)" }
 }
 
 Step "Cleanup before image capture" {

@@ -20,6 +20,8 @@ from app.services.secrets import delete_lab_credential_artifacts, get_lab_passwo
 
 TERMINATED_LAB_VISIBLE_HOURS = 24
 AWS_CLIENT_CONFIG = Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 1})
+PROVISIONING_CONCURRENCY = get_settings().lab_provisioning_concurrency
+_provisioning_semaphore = asyncio.Semaphore(PROVISIONING_CONCURRENCY)
 
 
 def _schedule_provision_lab(lab_id: str, position: int = 0) -> None:
@@ -42,7 +44,8 @@ def _schedule_terminate_lab(lab_id: str, reason: CleanupReason) -> None:
 async def _provision_lab_after_delay(lab_id: str, delay_seconds: int) -> None:
     if delay_seconds > 0:
         await asyncio.sleep(delay_seconds)
-    await provision_lab(lab_id)
+    async with _provisioning_semaphore:
+        await provision_lab(lab_id)
 
 
 async def _stop_lab_by_id(lab_id: str, reason: CleanupReason) -> None:
@@ -110,6 +113,10 @@ def _budget_spend(lab: Lab, now: datetime) -> float:
 
 def _budget_exhausted(lab: Lab, now: datetime) -> bool:
     return bool(lab.hourly_cost and _budget_spend(lab, now) >= lab.budget_limit)
+
+
+def _idle_reference_time(lab: Lab) -> datetime | None:
+    return lab.last_seen_at or lab.last_started_at
 
 
 def _requested_market(on_demand_hourly_cost: float, spot_hourly_cost: float | None) -> str:
@@ -219,6 +226,24 @@ async def _require_claude_profile_archives(region: str, profile_ids: list[str]) 
 
 def _is_spot_lab(lab: Lab) -> bool:
     return (lab.instance_market or "").lower() == "spot"
+
+
+def _should_relaunch_spot_on_resume_failure(lab: Lab, exc: Exception) -> bool:
+    if not _is_spot_lab(lab):
+        return False
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in [
+            "IncorrectSpotRequestState",
+            "InsufficientInstanceCapacity",
+            "InsufficientHostCapacity",
+            "SpotInstanceLimitExceeded",
+            "MaxSpotInstanceCountExceeded",
+            "already terminated",
+            "no available Spot capacity",
+        ]
+    )
 
 
 async def _was_terminated_by_expiry(db: AsyncSession, lab: Lab) -> bool:
@@ -641,7 +666,14 @@ async def provision_lab(lab_id: str) -> None:
             secret_ref, stored_value = await store_lab_password(lab.aws_region, lab.id, raw_password)
             lab.password_secret_ref = secret_ref
             lab.password_ciphertext = stored_value
-            db.add(AuditLog(actor="system", action="lab.provision.started", resource_id=lab.id, message="Launching Windows EC2 instance"))
+            db.add(
+                AuditLog(
+                    actor="system",
+                    action="lab.provision.started",
+                    resource_id=lab.id,
+                    message=f"Launching Windows EC2 instance from AMI {lab.windows_ami}",
+                )
+            )
             await db.commit()
 
             if lab.lab_type == "claude":
@@ -705,7 +737,7 @@ async def provision_lab(lab_id: str) -> None:
                     actor="system",
                     action="lab.instance.running",
                     resource_id=lab.id,
-                    message=f"EC2 instance {instance.instance_id} is running; checking RDP directly",
+                    message=f"EC2 instance {instance.instance_id} is running from AMI {lab.windows_ami}; checking RDP directly",
                 )
             )
             await db.commit()
@@ -840,6 +872,10 @@ async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> No
     if lab.status in {LabStatus.terminated, LabStatus.expired, LabStatus.interrupted}:
         errors: list[str] = []
         await _delete_lab_access_artifacts(lab, errors)
+        try:
+            await AwsEc2Service(lab.aws_region).terminate_lab_resources(lab_id=lab.id, primary_instance_id=lab.ec2_instance_id)
+        except Exception as exc:
+            errors.append(f"ec2: {exc}")
         await _delete_lab_password_secret(lab, errors)
         if errors:
             db.add(AuditLog(actor="system", action="lab.cleanup.residual_failed", resource_id=lab.id, message="; ".join(errors)))
@@ -860,21 +896,13 @@ async def terminate_lab(db: AsyncSession, lab: Lab, reason: CleanupReason) -> No
     errors: list[str] = []
     critical_errors: list[str] = []
     await _delete_lab_access_artifacts(lab, errors)
-    if lab.ec2_instance_id:
-        try:
-            ec2 = AwsEc2Service(lab.aws_region)
-            await ec2.terminate_instance(lab.ec2_instance_id, lab_id=lab.id)
-            await ec2.delete_available_lab_volumes(lab_id=lab.id)
-        except Exception as exc:
-            error = f"ec2: {exc}"
-            errors.append(error)
-            if "was not found" not in str(exc):
-                critical_errors.append(error)
-    else:
-        try:
-            await AwsEc2Service(lab.aws_region).delete_available_lab_volumes(lab_id=lab.id)
-        except Exception as exc:
-            errors.append(f"volumes: {exc}")
+    try:
+        await AwsEc2Service(lab.aws_region).terminate_lab_resources(lab_id=lab.id, primary_instance_id=lab.ec2_instance_id)
+    except Exception as exc:
+        error = f"ec2: {exc}"
+        errors.append(error)
+        if "was not found" not in str(exc):
+            critical_errors.append(error)
     credential_errors: list[str] = []
     await _delete_lab_password_secret(lab, credential_errors)
     critical_errors.extend(credential_errors)
@@ -992,7 +1020,7 @@ async def resume_lab(db: AsyncSession, lab: Lab) -> None:
         lab.last_started_at = lab.last_seen_at
         db.add(AuditLog(actor="system", action="lab.resume.finished", resource_id=lab.id, message="Lab is running again"))
     except Exception as exc:
-        if _is_spot_lab(lab) and ("IncorrectSpotRequestState" in str(exc) or "already terminated" in str(exc)):
+        if _should_relaunch_spot_on_resume_failure(lab, exc):
             db.add(
                 AuditLog(
                     actor="system",
@@ -1179,8 +1207,10 @@ async def find_due_labs(db: AsyncSession) -> list[tuple[Lab, CleanupReason]]:
             and _budget_exhausted(lab, now)
         ):
             due.append((lab, CleanupReason.budget))
-        elif lab.status == LabStatus.running and lab.last_seen_at and (now - _aware(lab.last_seen_at)).total_seconds() > lab.idle_timeout_minutes * 60:
-            due.append((lab, CleanupReason.idle))
+        elif lab.status == LabStatus.running:
+            idle_reference = _idle_reference_time(lab)
+            if idle_reference and (now - _aware(idle_reference)).total_seconds() > lab.idle_timeout_minutes * 60:
+                due.append((lab, CleanupReason.idle))
     return due
 
 

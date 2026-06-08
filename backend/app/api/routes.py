@@ -260,14 +260,18 @@ async def lab_credentials(
 
 
 @router.post("/student/login", response_model=StudentLabOut)
-async def student_login(payload: StudentLoginIn, db: AsyncSession = Depends(get_db)):
+async def student_login(payload: StudentLoginIn, background: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     lab = await db.scalar(select(Lab).where(visible_lab_filter(), Lab.username == payload.username).order_by(desc(Lab.created_at)))
     if not lab:
         raise HTTPException(status_code=401, detail="Invalid lab username or password")
     password = await get_lab_password(lab.aws_region, lab.password_secret_ref, lab.password_ciphertext)
     if password != payload.password:
         raise HTTPException(status_code=401, detail="Invalid lab username or password")
-    return StudentLabOut(lab=lab, access_url=lab.access_url, username=lab.username, password=password, progress=lab_progress(lab))
+    progress = lab_progress(lab)
+    if lab.status == LabStatus.stopped:
+        background.add_task(_resume_by_id, lab.id)
+        progress.append("Starting lab automatically")
+    return StudentLabOut(lab=lab, access_url=lab.access_url, username=lab.username, password=password, progress=progress)
 
 
 async def _terminate_by_id(lab_id: str) -> None:

@@ -19,6 +19,7 @@ export type Lab = {
   status: string;
   aws_region: string;
   instance_type: string;
+  windows_ami: string;
   lab_type: string;
   claude_profile_id: string | null;
   requested_instance_market: string;

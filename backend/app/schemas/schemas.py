@@ -92,6 +92,7 @@ class LabOut(BaseModel):
     status: LabStatus
     aws_region: str
     instance_type: str
+    windows_ami: str
     lab_type: str = "windows"
     claude_profile_id: str | None = None
     requested_instance_market: str = "on-demand"
@@ -150,6 +151,7 @@ class LabOut(BaseModel):
             "status": value.status,
             "aws_region": value.aws_region,
             "instance_type": value.instance_type,
+            "windows_ami": value.windows_ami,
             "lab_type": value.lab_type,
             "claude_profile_id": value.claude_profile_id,
             "requested_instance_market": value.requested_instance_market,

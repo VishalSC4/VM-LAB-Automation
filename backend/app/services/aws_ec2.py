@@ -9,11 +9,18 @@ import boto3
 from botocore.exceptions import ClientError, WaiterError
 from botocore.config import Config
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.core.config import get_settings
 
 log = structlog.get_logger()
+
+
+AWS_RETRY_CONFIG = Config(
+    connect_timeout=3,
+    read_timeout=10,
+    retries={"max_attempts": 3, "mode": "standard"},
+)
 
 
 @dataclass
@@ -32,6 +39,20 @@ def _is_instance_not_found(exc: ClientError) -> bool:
         "InvalidInstanceID.NotFound",
         "InvalidInstanceID.Malformed",
     }
+
+
+def _is_run_instances_throttle(exc: BaseException) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    code = exc.response.get("Error", {}).get("Code", "")
+    message = exc.response.get("Error", {}).get("Message", "").lower()
+    return code in {
+        "RequestLimitExceeded",
+        "RequestThrottled",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequestsException",
+    } or "request rate limit" in message
 
 
 def windows_user_data(
@@ -607,15 +628,20 @@ class AwsEc2Service:
         self.client = boto3.client(
             "ec2",
             region_name=region,
-            config=Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 1}),
+            config=AWS_RETRY_CONFIG,
         )
         self.s3_client = boto3.client(
             "s3",
             region_name=region,
-            config=Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 1}),
+            config=AWS_RETRY_CONFIG,
         )
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=60))
+    @retry(
+        retry=retry_if_exception(_is_run_instances_throttle),
+        stop=stop_after_attempt(8),
+        wait=wait_exponential(multiplier=3, min=5, max=90),
+        reraise=True,
+    )
     async def launch_windows_instance(
         self,
         *,
@@ -766,6 +792,7 @@ class AwsEc2Service:
                         {"Key": "ManagedBy", "Value": "cloud-lab-platform"},
                         {"Key": "OS", "Value": "Windows"},
                         {"Key": "cloudlab:lab_type", "Value": lab_type},
+                        {"Key": "cloudlab:ami_id", "Value": ami_id},
                         {"Key": "RAM", "Value": "8GB"},
                         {"Key": "vCPU", "Value": "4"},
                         {"Key": "Disk", "Value": root_disk_tag},
@@ -790,6 +817,7 @@ class AwsEc2Service:
                         {"Key": "Disk", "Value": root_disk_tag},
                         {"Key": "cloudlab:lab_id", "Value": lab_id},
                         {"Key": "cloudlab:batch_id", "Value": batch_id},
+                        {"Key": "cloudlab:ami_id", "Value": ami_id},
                     ],
                 },
             ],
@@ -885,8 +913,8 @@ class AwsEc2Service:
     ):
         if self._spot_enabled(instance_market):
             last_error: Exception | None = None
-            for subnet_id in self._lab_subnet_ids():
-                for candidate_type in self._spot_instance_types(instance_type):
+            for candidate_type in self._spot_instance_types(instance_type):
+                for subnet_id in self._lab_subnet_ids():
                     params = self._base_launch_params(
                         ami_id,
                         candidate_type,
@@ -921,8 +949,8 @@ class AwsEc2Service:
             log.warning("lab_spot_fallback_to_on_demand", lab_id=lab_id, requested_instance_type=instance_type)
 
         last_error = None
-        for subnet_id in self._lab_subnet_ids():
-            for candidate_type in self._spot_instance_types(instance_type):
+        for candidate_type in self._spot_instance_types(instance_type):
+            for subnet_id in self._lab_subnet_ids():
                 params = self._base_launch_params(
                     ami_id,
                     candidate_type,
@@ -1042,6 +1070,60 @@ class AwsEc2Service:
 
     async def terminate_instance(self, instance_id: str, *, lab_id: str) -> None:
         await asyncio.to_thread(self._terminate_sync, instance_id, lab_id)
+
+    async def terminate_lab_resources(self, *, lab_id: str, primary_instance_id: str | None = None) -> list[str]:
+        return await asyncio.to_thread(self._terminate_lab_resources_sync, lab_id, primary_instance_id)
+
+    def _active_lab_instances(self, lab_id: str) -> list[dict]:
+        response = self.client.describe_instances(
+            Filters=[
+                {"Name": "tag:cloudlab:lab_id", "Values": [lab_id]},
+                {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped", "shutting-down"]},
+            ]
+        )
+        return [instance for reservation in response["Reservations"] for instance in reservation["Instances"]]
+
+    def _terminate_lab_resources_sync(self, lab_id: str, primary_instance_id: str | None = None) -> list[str]:
+        instances_by_id: dict[str, dict] = {}
+        if primary_instance_id:
+            try:
+                primary = self._tagged_instance(primary_instance_id, lab_id)
+                instances_by_id[primary_instance_id] = primary
+            except RuntimeError as exc:
+                if "was not found" not in str(exc):
+                    raise
+
+        for instance in self._active_lab_instances(lab_id):
+            instances_by_id[instance["InstanceId"]] = instance
+
+        instances = list(instances_by_id.values())
+        spot_request_ids = [
+            instance.get("SpotInstanceRequestId")
+            for instance in instances
+            if instance.get("SpotInstanceRequestId")
+        ]
+        if spot_request_ids:
+            try:
+                self.client.cancel_spot_instance_requests(SpotInstanceRequestIds=list(dict.fromkeys(spot_request_ids)))
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                if code not in {"InvalidSpotInstanceRequestID.NotFound", "InvalidSpotInstanceRequestID.Malformed"}:
+                    raise
+
+        terminate_ids = [
+            instance["InstanceId"]
+            for instance in instances
+            if instance.get("State", {}).get("Name") not in {"terminated", "shutting-down"}
+        ]
+        if terminate_ids:
+            self.client.terminate_instances(InstanceIds=terminate_ids)
+            self.client.get_waiter("instance_terminated").wait(
+                InstanceIds=terminate_ids,
+                WaiterConfig={"Delay": 15, "MaxAttempts": 40},
+            )
+
+        self._delete_available_lab_volumes_sync(lab_id)
+        return terminate_ids
 
     def _terminate_sync(self, instance_id: str, lab_id: str) -> None:
         try:

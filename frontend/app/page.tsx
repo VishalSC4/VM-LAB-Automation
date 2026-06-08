@@ -29,8 +29,25 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { api, AUTH_EXPIRED_EVENT, AuditLog, Dashboard, Lab, LabCredentialsExport, StudentLab } from "@/lib/api";
 
+const labImagePresets = [
+  {
+    id: "powerbi",
+    label: "Power BI Assessment v1",
+    ami: "ami-0f7046e6098137c21",
+    instanceType: "t3a.xlarge",
+    name: "powerbi-lab",
+  },
+  {
+    id: "manual",
+    label: "Manual AMI",
+    ami: "",
+    instanceType: "t3a.xlarge",
+    name: "custom-lab",
+  },
+] as const;
+
 const defaults = {
-  name: "dev-lab",
+  name: "powerbi-lab",
   lab_type: "windows",
   user_count: 1,
   duration_hours: 4,
@@ -38,7 +55,8 @@ const defaults = {
   budget_per_vm: 10,
   aws_region: "ap-south-1",
   instance_type: "t3a.xlarge",
-  windows_ami: "ami-06e8bc8e415e16e9f",
+  windows_ami: "ami-0f7046e6098137c21",
+  image_preset: "powerbi",
   idle_timeout_minutes: 60,
   schedule_enabled: false,
   schedule_start_date: new Date().toISOString().slice(0, 10),
@@ -159,6 +177,11 @@ function statusTone(status: string): string {
   return "status-pill";
 }
 
+function labImageLabel(ami: string): string {
+  const preset = labImagePresets.find((item) => item.ami === ami);
+  return preset ? `${preset.label} (${ami})` : ami;
+}
+
 function progressSteps(lab: Lab): string[] {
   const steps = [
     lab.ec2_instance_id ? "EC2 ready" : "Creating EC2",
@@ -231,7 +254,7 @@ export default function Home() {
       const matchesFilter = viewMatchesLab(labFilter, lab);
       const matchesQuery =
         !normalizedQuery ||
-        [lab.owner_label, lab.username, lab.lab_type, lab.claude_profile_id ?? "", lab.instance_type, lab.instance_market, lab.aws_region, lab.ec2_instance_id ?? "", lab.private_ip ?? ""]
+        [lab.owner_label, lab.username, lab.lab_type, lab.claude_profile_id ?? "", lab.instance_type, lab.instance_market, lab.aws_region, lab.windows_ami, lab.ec2_instance_id ?? "", lab.private_ip ?? ""]
           .join(" ")
           .toLowerCase()
           .includes(normalizedQuery);
@@ -279,7 +302,8 @@ export default function Home() {
     setBusy(true);
     setError("");
     try {
-      const { duration_minutes, ...batchForm } = form;
+      const { duration_minutes, image_preset, ...batchForm } = form;
+      void image_preset;
       const payload = {
         ...batchForm,
         duration_hours: Number(form.duration_hours) + Number(duration_minutes) / 60,
@@ -467,6 +491,23 @@ export default function Home() {
     }
   }
 
+  useEffect(() => {
+    if (!studentLab || !studentUsername || !studentPassword) return;
+    if (!["stopped", "resuming", "provisioning"].includes(studentLab.lab.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const result = await api<StudentLab>("/student/login", {
+          method: "POST",
+          body: JSON.stringify({ username: studentUsername, password: studentPassword }),
+        });
+        setStudentLab(result);
+      } catch {
+        window.clearInterval(timer);
+      }
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [studentLab, studentUsername, studentPassword]);
+
   async function copyStudentCredentials() {
     if (!studentLab) return;
     const text = `URL: ${studentLab.access_url ? labAccessHref(studentLab.access_url) : ""}\nUsername: ${studentLab.username}\nPassword: ${studentLab.password}`;
@@ -532,7 +573,7 @@ export default function Home() {
             <section className="auth-panel p-6 sm:p-8">
               <div className="mb-8 flex items-center justify-between gap-4">
                 <div className="brand-tile h-14 w-32">
-                  <Image src="/unext-logo.jpeg" alt="UNext" width={128} height={40} className="max-h-10 w-auto object-contain" priority />
+                  <Image src="/unext-logo.svg" alt="UNext" width={42} height={44} className="max-h-10 w-auto object-contain" priority />
                 </div>
                 <div className="icon-badge">
                   <Shield className="h-5 w-5" />
@@ -595,12 +636,15 @@ export default function Home() {
                       <p className="truncate font-black text-ink">{studentLab.lab.owner_label}</p>
                       <span className={statusTone(studentLab.lab.status)}>{studentLab.lab.status}</span>
                     </div>
-                    {studentLab.access_url && (
+                    {studentLab.access_url && studentLab.lab.status === "running" && (
                       <a className="open-link" href={labAccessHref(studentLab.access_url)} target="_blank" rel="noreferrer">
                         <ExternalLink className="h-4 w-4" /> Open
                       </a>
                     )}
                   </div>
+                  {["stopped", "resuming", "provisioning"].includes(studentLab.lab.status) && (
+                    <p className="mt-3 text-sm font-semibold text-amber-700">Your lab is starting. This can take a few minutes after idle stop.</p>
+                  )}
                   <div className="mt-3 flex flex-wrap gap-2">
                     {studentLab.progress.map((step) => <span key={step} className="progress-chip">{step}</span>)}
                   </div>
@@ -620,7 +664,7 @@ export default function Home() {
         <div className="mx-auto flex max-w-[1480px] items-center justify-between px-4 py-3 sm:px-5">
           <div className="flex items-center gap-3">
             <div className="brand-tile h-11 w-24">
-              <Image src="/unext-logo.jpeg" alt="UNext" width={96} height={36} className="max-h-9 w-auto object-contain" />
+              <Image src="/unext-logo.svg" alt="UNext" width={42} height={44} className="max-h-9 w-auto object-contain" />
             </div>
             <div>
               <h1 className="text-base font-black text-ink sm:text-xl">Cloud Lab Platform</h1>
@@ -723,6 +767,7 @@ export default function Home() {
                       <div className="lab-row-facts">
                         <span><Cpu className="h-3.5 w-3.5" /> {lab.instance_type}</span>
                         <span><Server className="h-3.5 w-3.5" /> {lab.lab_type === "claude" ? "Claude" : "Windows"}</span>
+                        <span><Server className="h-3.5 w-3.5" /> {labImageLabel(lab.windows_ami)}</span>
                         {lab.claude_profile_id && <span><KeyRound className="h-3.5 w-3.5" /> {lab.claude_profile_id}</span>}
                         <span><Zap className="h-3.5 w-3.5" /> {lab.instance_market === "spot" ? "Spot" : "On-Demand"}</span>
                         <span><Clock className="h-3.5 w-3.5" /> {remainingTime(lab)}</span>
@@ -748,6 +793,7 @@ export default function Home() {
                           <div className="grid gap-3 sm:grid-cols-3">
                             <div className="lab-stat"><Cpu className="h-4 w-4" /><span>Instance</span><strong>{lab.instance_type}</strong></div>
                             <div className="lab-stat"><Server className="h-4 w-4" /><span>Lab type</span><strong>{lab.lab_type === "claude" ? "Claude Desktop" : "Windows"}</strong></div>
+                            <div className="lab-stat sm:col-span-2"><Server className="h-4 w-4" /><span>AMI</span><strong>{labImageLabel(lab.windows_ami)}</strong></div>
                             {lab.claude_profile_id && <div className="lab-stat"><KeyRound className="h-4 w-4" /><span>Claude profile</span><strong>{lab.claude_profile_id}</strong></div>}
                             <div className="lab-stat"><Zap className="h-4 w-4" /><span>Market</span><strong>{lab.instance_market === "spot" ? "Spot" : "On-Demand"}</strong></div>
                             <div className="lab-stat"><Clock className="h-4 w-4" /><span>Runtime</span><strong>{runtimeLabel(runtime)}</strong></div>
@@ -897,10 +943,30 @@ export default function Home() {
                 <h2>Infrastructure</h2>
                 <p className="mb-3 text-xs font-bold text-slate-500">New labs use the server market policy; Spot labs may end early if AWS reclaims capacity.</p>
                 <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="form-label">
+                    Lab image
+                    <select
+                      className="field-3d mt-1.5 w-full"
+                      value={form.image_preset}
+                      onChange={(e) => {
+                        const preset = labImagePresets.find((item) => item.id === e.target.value) ?? labImagePresets[0];
+                        setForm({
+                          ...form,
+                          image_preset: preset.id,
+                          name: preset.id === "manual" ? form.name : preset.name,
+                          windows_ami: preset.ami || form.windows_ami,
+                          instance_type: preset.instanceType,
+                        });
+                      }}
+                    >
+                      {labImagePresets.map((preset) => (
+                        <option key={preset.id} value={preset.id}>{preset.label}</option>
+                      ))}
+                    </select>
+                  </label>
                   {[
                     ["aws_region", "AWS region"],
                     ["instance_type", "Instance type"],
-                    ["windows_ami", "Golden Windows AMI"],
                     ["idle_timeout_minutes", "Idle timeout minutes"],
                   ].map(([key, label]) => (
                     <label key={key} className="form-label">
@@ -912,6 +978,15 @@ export default function Home() {
                       />
                     </label>
                   ))}
+                  <label className="form-label sm:col-span-2">
+                    AMI ID used for launch
+                    <input
+                      className="field-3d mt-1.5 w-full"
+                      value={form.windows_ami}
+                      onChange={(e) => setForm({ ...form, image_preset: "manual", windows_ami: e.target.value.trim() })}
+                    />
+                    <span className="mt-1 block text-xs font-bold text-slate-500">Selected: {labImageLabel(form.windows_ami)}</span>
+                  </label>
                 </div>
               </div>
               <div className="launch-card">

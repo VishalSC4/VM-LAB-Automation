@@ -151,7 +151,7 @@ For best reliability:
 
 ## Cost and Boot Optimization
 
-- Keep Claude Desktop in the Claude AMI, not installed at boot, for the fastest startup. The current Claude-ready AMI is `ami-06e8bc8e415e16e9f`.
+- Keep Claude Desktop in the Claude AMI, not installed at boot, for the fastest startup. The current Claude-ready AMI is `ami-048ef4334196ef5c7`, rebuilt from `ami-0f7f1c3f50ab704b5` with the Recycle Bin verified empty.
 - Use gp3 root volumes sized only as needed.
 - Use schedules and idle stop for On-Demand labs.
 - Use Spot only for disposable Claude sessions because Spot labs can be interrupted.
